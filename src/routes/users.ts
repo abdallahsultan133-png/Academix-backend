@@ -30,6 +30,38 @@ router.get("/teachers", requireAuth, async (req, res) => {
     }
 });
 
+// GET /api/users/students?search= — teacher/admin/super_admin only (exposes
+// every student's email, so it can't be open to students/parents). Used by
+// the class enrollment picker to browse/search the full student directory
+// instead of requiring an exact email lookup per student.
+router.get("/students", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+    try {
+        const { search } = req.query;
+
+        const conditions = [eq(user.role, "student")];
+        if (search) {
+            conditions.push(
+                or(
+                    ilike(user.name, `%${search}%`),
+                    ilike(user.email, `%${search}%`)
+                )!
+            );
+        }
+
+        const students = await db
+            .select({ id: user.id, name: user.name, email: user.email, image: user.image })
+            .from(user)
+            .where(and(...conditions))
+            .orderBy(user.name)
+            .limit(500);
+
+        res.json({ data: students });
+    } catch (e) {
+        console.error("GET /users/students error:", e);
+        res.status(500).json({ error: "Failed to get students" });
+    }
+});
+
 // GET /api/users/lookup?email= — any authenticated user can resolve a single
 // exact-email match to start a conversation with them. Unlike GET / (below),
 // this doesn't allow browsing/searching the directory: it requires an exact

@@ -8,6 +8,7 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createClassSchema, updateClassSchema, enrollSchema, joinClassSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
+import { canAccessClass } from "../lib/access-control.js";
 
 const router = express.Router();
 
@@ -90,6 +91,13 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(user.name, teacherPattern));
         }
 
+        // A teacher only sees the classes they teach themselves — not every
+        // teacher's classes. Admins, parents, and super_admins see everything;
+        // students keep browsing/joining the full catalog as before.
+        if (req.user!.role === "teacher") {
+            filterConditions.push(eq(classes.teacherId, req.user!.id!));
+        }
+
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
 
@@ -165,9 +173,14 @@ router.get('/:id', requireAuth, async (req, res) => {
 
 router.post('/', requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createClassSchema), async (req, res) => {
     try {
+        // A teacher can only create a class taught by themselves — the body's
+        // teacherId is ignored for that role so they can't assign a class to
+        // (or see it show up under) another teacher. Admins may assign anyone.
+        const teacherId = req.user!.role === "teacher" ? req.user!.id! : req.body.teacherId;
+
         const [createdClass] = await db
             .insert(classes)
-            .values({...req.body, inviteCode: Math.random().toString(36).substring(2, 9), schedules: []})
+            .values({...req.body, teacherId, inviteCode: Math.random().toString(36).substring(2, 9), schedules: []})
             .returning({ id: classes.id });
 
         if(!createdClass) throw Error;
@@ -198,12 +211,16 @@ router.put('/:id', requireAuth, requireRole("teacher", "admin", "super_admin"), 
             status?: "active" | "inactive" | "archived";
         };
 
+        // Only an admin may reassign a class to a different teacher — a
+        // teacher editing their own class can't hand it off to someone else.
+        const isAdmin = req.user!.role === "admin" || req.user!.role === "super_admin";
+
         const [updated] = await db
             .update(classes)
             .set({
                 ...(name !== undefined ? { name } : {}),
                 ...(subjectId !== undefined ? { subjectId } : {}),
-                ...(teacherId !== undefined ? { teacherId } : {}),
+                ...(teacherId !== undefined && isAdmin ? { teacherId } : {}),
                 ...(description !== undefined ? { description } : {}),
                 ...(capacity !== undefined ? { capacity } : {}),
                 ...(bannerUrl !== undefined ? { bannerUrl } : {}),
@@ -239,19 +256,24 @@ router.delete('/:id', requireAuth, requireRole("admin", "super_admin"), async (r
 });
 
 // GET /api/classes/:id/students — enrolled students roster.
-// Staff can view any roster; a student may only view rosters of classes
-// they're enrolled in; a parent may only view rosters that include one of
-// their linked children. Without this check any authenticated student could
-// enumerate the full roster (name + email) of any class in the school.
+// Admins/super_admins can view any roster; a teacher only rosters of classes
+// they teach; a student may only view rosters of classes they're enrolled
+// in; a parent may only view rosters that include one of their linked
+// children. Without this check any authenticated student could enumerate
+// the full roster (name + email) of any class in the school.
 router.get('/:id/students', requireAuth, async (req, res) => {
     try {
         const classId = Number(req.params.id);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: 'Invalid class id' });
 
         const caller = req.user!;
-        const isStaff = caller.role === "teacher" || caller.role === "admin" || caller.role === "super_admin";
+        const isAdmin = caller.role === "admin" || caller.role === "super_admin";
 
-        if (!isStaff) {
+        if (caller.role === "teacher" && !(await canAccessClass(caller, classId))) {
+            return res.status(403).json({ error: "You can only view rosters for classes you teach." });
+        }
+
+        if (!isAdmin && caller.role !== "teacher") {
             if (caller.role === "student") {
                 const [own] = await db
                     .select({ studentId: enrollments.studentId })
@@ -287,6 +309,11 @@ router.get('/:id/students', requireAuth, async (req, res) => {
 router.post('/:id/enroll', requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(enrollSchema), async (req, res) => {
     try {
         const classId = Number(req.params.id);
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only enroll students into classes you teach." });
+        }
+
         const { studentId, email } = req.body as { studentId?: string; email?: string };
 
         let resolvedId = studentId;
@@ -309,6 +336,11 @@ router.post('/:id/enroll', requireAuth, requireRole("teacher", "admin", "super_a
 router.delete('/:id/enroll/:studentId', requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
     try {
         const classId = Number(req.params.id);
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only remove students from classes you teach." });
+        }
+
         const studentId = String(req.params.studentId ?? "");
         await db.delete(enrollments).where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, studentId)));
         await logAction({ req, action: "class.unenroll", resource: "enrollments", resourceId: classId, details: `Removed student ${studentId}` });

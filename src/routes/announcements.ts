@@ -10,12 +10,15 @@ import { createAnnouncementSchema, updateAnnouncementSchema } from "../lib/schem
 import { notifyEnrolledStudents } from "./notifications.js";
 import { sendAnnouncementEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
+import { canAccessClass } from "../lib/access-control.js";
 
 const router = express.Router();
 
 // GET /api/announcements?classId=
 // Students only see global announcements + announcements for classes they're enrolled in.
-// Teachers/admins see everything (optionally filtered to one class).
+// Teachers only see global announcements + announcements for classes they teach —
+// not every teacher's. Admins/super_admins/parents see everything (optionally
+// filtered to one class).
 router.get("/", requireAuth, async (req, res) => {
     try {
         const { classId } = req.query;
@@ -27,6 +30,18 @@ router.get("/", requireAuth, async (req, res) => {
                 .select({ classId: enrollments.classId })
                 .from(enrollments)
                 .where(eq(enrollments.studentId, req.user.id!));
+
+            const classIds = myClasses.map((c) => c.classId);
+            visibilityClause = classIds.length > 0
+                ? or(isNull(announcements.classId), inArray(announcements.classId, classIds))
+                : isNull(announcements.classId);
+        }
+
+        if (req.user?.role === "teacher") {
+            const myClasses = await db
+                .select({ classId: classes.id })
+                .from(classes)
+                .where(eq(classes.teacherId, req.user.id!));
 
             const classIds = myClasses.map((c) => c.classId);
             visibilityClause = classIds.length > 0
@@ -68,6 +83,10 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             content: string;
             pinned?: boolean;
         };
+
+        if (classId && req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only post announcements for classes you teach." });
+        }
 
         const [created] = await db
             .insert(announcements)

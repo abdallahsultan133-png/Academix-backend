@@ -64,18 +64,32 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
             });
         }
 
+        // A student sees the org-wide student/teacher/class/subject counts (same
+        // as everyone else), but their attendance rate is their own — not the
+        // school-wide average.
+        const isStudent = req.user?.role === "student";
+        const studentId = req.user?.id;
+
         const [students, teachers, totalClasses, totalSubjects, [attendanceStats], [pendingGrading]] = await Promise.all([
             db.select({ total: count() }).from(user).where(eq(user.role, "student")),
             db.select({ total: count() }).from(user).where(eq(user.role, "teacher")),
             db.select({ total: count() }).from(classes),
             db.select({ total: count() }).from(subjects),
-            db
-                .select({
-                    total: sql<number>`count(*)`,
-                    present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
-                })
-                .from(attendance)
-                .where(gte(attendance.date, daysAgoISO(30))),
+            isStudent && studentId
+                ? db
+                    .select({
+                        total: sql<number>`count(*)`,
+                        present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
+                    })
+                    .from(attendance)
+                    .where(and(eq(attendance.studentId, studentId), gte(attendance.date, daysAgoISO(30))))
+                : db
+                    .select({
+                        total: sql<number>`count(*)`,
+                        present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
+                    })
+                    .from(attendance)
+                    .where(gte(attendance.date, daysAgoISO(30))),
             db
                 .select({ total: count() })
                 .from(submissions)
@@ -203,14 +217,17 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
 });
 
 // GET /api/dashboard/attendance-trend — daily attendance rate for the last 14 days.
-// Scoped to the teacher's own classes for teachers; org-wide for everyone else.
+// Scoped to the teacher's own classes for teachers, to the student's own
+// attendance for students; org-wide for everyone else.
 dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
     try {
         const isTeacher = req.user?.role === "teacher";
-        const teacherId = req.user?.id;
+        const isStudent = req.user?.role === "student";
+        const userId = req.user?.id;
 
         const conditions = [gte(attendance.date, daysAgoISO(14))];
-        if (isTeacher && teacherId) conditions.push(eq(classes.teacherId, teacherId));
+        if (isTeacher && userId) conditions.push(eq(classes.teacherId, userId));
+        if (isStudent && userId) conditions.push(eq(attendance.studentId, userId));
 
         const rows = await db
             .select({
@@ -236,19 +253,26 @@ dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
     }
 });
 
-// GET /api/dashboard/grade-distribution — count of students per letter grade.
-// Scoped to the teacher's own classes for teachers; org-wide for everyone else.
+// GET /api/dashboard/grade-distribution — count of (students | the caller's own
+// classes) per letter grade. Scoped to the teacher's own classes for teachers,
+// to the student's own grades for students ("Student Performance" on their
+// dashboard, not the whole class's); org-wide for everyone else.
 dashboardRouter.get("/grade-distribution", requireAuth, async (req, res) => {
     try {
         const isTeacher = req.user?.role === "teacher";
-        const teacherId = req.user?.id;
-        const teacherScope = isTeacher && teacherId ? eq(classes.teacherId, teacherId) : undefined;
+        const isStudent = req.user?.role === "student";
+        const userId = req.user?.id;
+        const scopeClause = isTeacher && userId
+            ? eq(classes.teacherId, userId)
+            : isStudent && userId
+                ? eq(classGrades.studentId, userId)
+                : undefined;
 
         const rows = await db
             .select({ letterGrade: classGrades.letterGrade, total: sql<number>`count(*)` })
             .from(classGrades)
             .innerJoin(classes, eq(classGrades.classId, classes.id))
-            .where(teacherScope)
+            .where(scopeClause)
             .groupBy(classGrades.letterGrade);
 
         const counts: Record<string, number> = { A: 0, B: 0, C: 0, D: 0, F: 0 };

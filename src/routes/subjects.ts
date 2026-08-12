@@ -38,6 +38,12 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(departments.name, deptPattern));
         }
 
+        // A teacher only sees the subjects they created themselves — not the
+        // whole school's. Admins, parents, and super_admins see everything.
+        if (req.user!.role === "teacher") {
+            filterConditions.push(eq(subjects.createdBy, req.user!.id!));
+        }
+
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
 

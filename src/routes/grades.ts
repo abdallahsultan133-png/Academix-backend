@@ -8,7 +8,7 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createExamSchema, examResultsSchema, gradebookSaveSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessStudent } from "../lib/access-control.js";
+import { canAccessClass, canAccessStudent } from "../lib/access-control.js";
 
 const router = express.Router();
 
@@ -33,6 +33,9 @@ router.get("/exams", requireAuth, async (req, res) => {
     try {
         const classId = req.query.classId ? Number(req.query.classId) : undefined;
         const conditions = classId ? [eq(exams.classId, classId)] : [];
+        // A teacher only sees exams for classes they teach — not every
+        // teacher's. Admins, parents, and super_admins see everything.
+        if (req.user!.role === "teacher") conditions.push(eq(classes.teacherId, req.user!.id!));
 
         const list = await db
             .select({
@@ -61,6 +64,10 @@ router.post("/exams", requireAuth, requireRole("teacher", "admin", "super_admin"
             scheduledAt?: string | null; durationMinutes?: number | null; maxScore?: number; venue?: string | null;
         };
 
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only create exams for classes you teach." });
+        }
+
         const [created] = await db.insert(exams).values({
             classId,
             title: title.trim(),
@@ -85,6 +92,13 @@ router.post("/exams", requireAuth, requireRole("teacher", "admin", "super_admin"
 router.delete("/exams/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
     try {
         const id = Number(req.params.id);
+
+        const [existing] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, id));
+        if (!existing) return res.status(404).json({ error: "Exam not found" });
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
+            return res.status(403).json({ error: "You can only delete exams for classes you teach." });
+        }
+
         const [deleted] = await db.delete(exams).where(eq(exams.id, id)).returning({ id: exams.id });
         if (!deleted) return res.status(404).json({ error: "Exam not found" });
         await logAction({ req, action: "exam.delete", resource: "exams", resourceId: id });
@@ -101,6 +115,14 @@ router.delete("/exams/:id", requireAuth, requireRole("teacher", "admin", "super_
 router.get("/exams/:examId/results", requireAuth, async (req, res) => {
     try {
         const examId = Number(req.params.examId);
+
+        if (req.user!.role === "teacher") {
+            const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
+            if (!exam) return res.status(404).json({ error: "Exam not found" });
+            if (!(await canAccessClass(req.user!, exam.classId))) {
+                return res.status(403).json({ error: "You can only view results for classes you teach." });
+            }
+        }
 
         const rows = await db
             .select({
@@ -128,6 +150,14 @@ router.post("/exams/:examId/results", requireAuth, requireRole("teacher", "admin
     try {
         const examId = Number(req.params.examId);
         const { records } = req.body as { records: Array<{ studentId: string; score: number; remarks?: string | null }> };
+
+        if (req.user!.role === "teacher") {
+            const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
+            if (!exam) return res.status(404).json({ error: "Exam not found" });
+            if (!(await canAccessClass(req.user!, exam.classId))) {
+                return res.status(403).json({ error: "You can only grade exams for classes you teach." });
+            }
+        }
 
         const gradedBy = req.user!.id!;
         const result = await db
@@ -161,6 +191,18 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
     try {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid classId" });
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only view the gradebook for classes you teach." });
+        }
+
+        if (req.user!.role === "student") {
+            const [enrolled] = await db
+                .select({ studentId: enrollments.studentId })
+                .from(enrollments)
+                .where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!)));
+            if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
+        }
 
         const [roster, assignmentAvgs, examAvgs, savedGrades] = await Promise.all([
             // All enrolled students
@@ -235,7 +277,12 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             };
         });
 
-        res.json({ data: gradebook });
+        // A student only sees their own row, never the rest of the class's grades.
+        const visible = req.user!.role === "student"
+            ? gradebook.filter((row) => row.studentId === req.user!.id)
+            : gradebook;
+
+        res.json({ data: visible });
     } catch (e) {
         console.error("GET /grades/gradebook/:classId error:", e);
         res.status(500).json({ error: "Failed to load gradebook" });
@@ -249,6 +296,10 @@ router.post("/gradebook/:classId/save", requireAuth, requireRole("teacher", "adm
         const { records } = req.body as {
             records: Array<{ studentId: string; finalGrade: number; remarks?: string | null }>
         };
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only save grades for classes you teach." });
+        }
 
         const gradedBy = req.user!.id!;
         const result = await db

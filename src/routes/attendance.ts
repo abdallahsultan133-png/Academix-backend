@@ -8,7 +8,7 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { markAttendanceSchema, qrGenerateSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessStudent } from "../lib/access-control.js";
+import { canAccessClass, canAccessStudent } from "../lib/access-control.js";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -25,6 +25,10 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
 
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
         if (!DATE_RE.test(date)) return res.status(400).json({ error: "date query param must be YYYY-MM-DD" });
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only view rosters for classes you teach." });
+        }
 
         const roster = await db
             .select({
@@ -67,6 +71,10 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             records: Array<{ studentId: string; status: "present" | "absent" | "late" | "excused"; notes?: string | null }>;
         };
 
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only mark attendance for classes you teach." });
+        }
+
         const markedBy = req.user!.id!;
 
         const results = await db
@@ -108,6 +116,18 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
 
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only view reports for classes you teach." });
+        }
+
+        if (req.user!.role === "student") {
+            const [enrolled] = await db
+                .select({ studentId: enrollments.studentId })
+                .from(enrollments)
+                .where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!)));
+            if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
+        }
+
         const { from, to } = req.query as { from?: string; to?: string };
         const conditions = [eq(attendance.classId, classId)];
         if (from && DATE_RE.test(from)) conditions.push(gte(attendance.date, from));
@@ -127,7 +147,11 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
             .from(enrollments)
             .innerJoin(user, eq(enrollments.studentId, user.id))
             .leftJoin(attendance, and(eq(attendance.studentId, enrollments.studentId), ...conditions))
-            .where(eq(enrollments.classId, classId))
+            .where(
+                req.user!.role === "student"
+                    ? and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!))
+                    : eq(enrollments.classId, classId)
+            )
             .groupBy(user.id, user.name, user.email)
             .orderBy(user.name);
 
@@ -188,6 +212,10 @@ router.post("/qr/generate", requireAuth, requireRole("teacher", "admin", "super_
         const { classId, date, expiryMinutes = 15 } = req.body as {
             classId: number; date: string; expiryMinutes?: number;
         };
+
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only generate QR sessions for classes you teach." });
+        }
 
         const token = crypto.randomBytes(24).toString("hex");
         const expiresAt = new Date(Date.now() + (expiryMinutes ?? 15) * 60 * 1000);

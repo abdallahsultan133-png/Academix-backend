@@ -10,6 +10,7 @@ import { createAssignmentSchema, updateAssignmentSchema, submitAssignmentSchema,
 import { notifyEnrolledStudents, notifyStudent } from "./notifications.js";
 import { sendAssignmentEmail, sendGradeEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
+import { canAccessClass } from "../lib/access-control.js";
 
 const router = express.Router();
 
@@ -25,6 +26,9 @@ router.get("/", requireAuth, async (req, res) => {
 
         const conditions = [];
         if (classId) conditions.push(eq(assignments.classId, Number(classId)));
+        // A teacher only sees assignments for classes they teach — not every
+        // teacher's. Admins, parents, and super_admins see everything.
+        if (req.user!.role === "teacher") conditions.push(eq(classes.teacherId, req.user!.id!));
         const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
         const list = await db
@@ -98,6 +102,10 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             attachmentName?: string | null;
         };
 
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
+            return res.status(403).json({ error: "You can only create assignments for classes you teach." });
+        }
+
         const [created] = await db
             .insert(assignments)
             .values({
@@ -155,6 +163,12 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
 
+        const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
+        if (!existing) return res.status(404).json({ error: "Assignment not found" });
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
+            return res.status(403).json({ error: "You can only edit assignments for classes you teach." });
+        }
+
         const { title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
             title?: string;
             description?: string;
@@ -195,6 +209,12 @@ router.delete("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+
+        const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
+        if (!existing) return res.status(404).json({ error: "Assignment not found" });
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
+            return res.status(403).json({ error: "You can only delete assignments for classes you teach." });
+        }
 
         const [deleted] = await db.delete(assignments).where(eq(assignments.id, id)).returning({ id: assignments.id });
         if (!deleted) return res.status(404).json({ error: "Assignment not found" });
@@ -277,6 +297,12 @@ router.get("/:id/submissions", requireAuth, requireRole("teacher", "admin", "sup
         const assignmentId = Number(req.params.id);
         if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid assignment id" });
 
+        const [assignment] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, assignmentId));
+        if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, assignment.classId))) {
+            return res.status(403).json({ error: "You can only view submissions for classes you teach." });
+        }
+
         const rows = await db
             .select({
                 ...getTableColumns(submissions),
@@ -299,6 +325,18 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole("teacher
     try {
         const submissionId = Number(req.params.submissionId);
         if (!Number.isFinite(submissionId)) return res.status(400).json({ error: "Invalid submission id" });
+
+        if (req.user!.role === "teacher") {
+            const [existingSubmission] = await db
+                .select({ classId: assignments.classId })
+                .from(submissions)
+                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .where(eq(submissions.id, submissionId));
+            if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
+            if (!(await canAccessClass(req.user!, existingSubmission.classId))) {
+                return res.status(403).json({ error: "You can only grade submissions for classes you teach." });
+            }
+        }
 
         const { score, feedback } = req.body as { score: number; feedback?: string | null };
 
