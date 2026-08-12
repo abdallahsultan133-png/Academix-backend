@@ -1,0 +1,3 @@
+ALTER TABLE "student_profiles" ADD COLUMN "parent_user_id" text;--> statement-breakpoint
+ALTER TABLE "student_profiles" ADD CONSTRAINT "student_profiles_parent_user_id_user_id_fk" FOREIGN KEY ("parent_user_id") REFERENCES "public"."user"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "student_profiles_parent_user_id_idx" ON "student_profiles" USING btree ("parent_user_id");
