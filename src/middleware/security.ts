@@ -49,6 +49,7 @@ const securityMiddleware = async (req: Request, res: Response, next: NextFunctio
         }
 
         if(decision.isDenied() && decision.reason.isShield()) {
+            console.warn('[Arcjet Shield] Blocked', req.method, req.originalUrl, JSON.stringify(decision.reason));
             return res.status(403).json({ error: 'Forbidden', message: 'Request blocked by security policy' });
         }
 

@@ -24,8 +24,15 @@ const aj = arcjet({
     key: process.env.ARCJET_KEY!,
 
     rules: [
+        // Shield pattern-matches request bodies/params/headers for SQLi/XSS-style
+        // signatures and is prone to false positives on ordinary app traffic (JSON
+        // bodies, filter/sort query params, etc). Running it in DRY_RUN always —
+        // regardless of ARCJET_MODE — means it still logs to the Arcjet dashboard
+        // for review, but never blocks a real logged-in user over a false alarm.
+        // Flip to `mode: ARCJET_MODE` once findings have been reviewed and rules
+        // tuned (e.g. via shield's allow/deny config) for this app's real traffic.
         shield({
-            mode: ARCJET_MODE,
+            mode: "DRY_RUN",
         }),
 
         detectBot({
