@@ -17,7 +17,9 @@ export const user = pgTable("user", {
     role: roleEnum("role").default("student").notNull(),
     imageCldPubId: text("image_cld_pub_id"),
     ...timestamps
-});
+}, (table) => [
+    index("user_role_idx").on(table.role),
+]);
 
 export const session = pgTable("session", {
     id: text("id").primaryKey(),

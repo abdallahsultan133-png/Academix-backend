@@ -83,21 +83,22 @@ router.get("/", requireAuth, requireRole("admin", "super_admin"), async (req, re
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
 
-        const countResult = await db
-            .select({ count: sql<number>`count(*)`})
-            .from(user)
-            .where(whereClause);
+        const [countResult, usersList] = await Promise.all([
+            db
+                .select({ count: sql<number>`count(*)`})
+                .from(user)
+                .where(whereClause),
+            db
+                .select({
+                    ...getTableColumns(user),
+                }).from(user)
+                .where(whereClause)
+                .orderBy(desc(user.createdAt))
+                .limit(limitPerPage)
+                .offset(offset),
+        ]);
 
         const totalCount = countResult[0]?.count ?? 0;
-
-        const usersList = await db
-            .select({
-                ...getTableColumns(user),
-            }).from(user)
-            .where(whereClause)
-            .orderBy(desc(user.createdAt))
-            .limit(limitPerPage)
-            .offset(offset);
 
         res.status(200).json({
             data: usersList,

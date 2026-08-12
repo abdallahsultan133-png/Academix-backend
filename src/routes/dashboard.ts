@@ -16,27 +16,27 @@ const daysAgoISO = (days: number) => {
 
 dashboardRouter.get("/stats", requireAuth, async (_req, res) => {
     try {
-        const students = await db.select({ total: count() }).from(user).where(eq(user.role, "student"));
-        const teachers = await db.select({ total: count() }).from(user).where(eq(user.role, "teacher"));
-        const totalClasses = await db.select({ total: count() }).from(classes);
-        const totalSubjects = await db.select({ total: count() }).from(subjects);
-
-        const [attendanceStats] = await db
-            .select({
-                total: sql<number>`count(*)`,
-                present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
-            })
-            .from(attendance)
-            .where(gte(attendance.date, daysAgoISO(30)));
+        const [students, teachers, totalClasses, totalSubjects, [attendanceStats], [pendingGrading]] = await Promise.all([
+            db.select({ total: count() }).from(user).where(eq(user.role, "student")),
+            db.select({ total: count() }).from(user).where(eq(user.role, "teacher")),
+            db.select({ total: count() }).from(classes),
+            db.select({ total: count() }).from(subjects),
+            db
+                .select({
+                    total: sql<number>`count(*)`,
+                    present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
+                })
+                .from(attendance)
+                .where(gte(attendance.date, daysAgoISO(30))),
+            db
+                .select({ total: count() })
+                .from(submissions)
+                .where(eq(submissions.status, "submitted")),
+        ]);
 
         const attendanceRate = attendanceStats && attendanceStats.total > 0
             ? Math.round((attendanceStats.present / attendanceStats.total) * 1000) / 10
             : null;
-
-        const [pendingGrading] = await db
-            .select({ total: count() })
-            .from(submissions)
-            .where(eq(submissions.status, "submitted"));
 
         res.json({
             students: students[0]?.total ?? 0,
@@ -56,42 +56,42 @@ dashboardRouter.get("/stats", requireAuth, async (_req, res) => {
 // Merges the most recent announcements, assignments, and submissions into one feed.
 dashboardRouter.get("/recent-activity", requireAuth, async (_req, res) => {
     try {
-        const recentAnnouncements = await db
-            .select({
-                id: announcements.id,
-                title: announcements.title,
-                createdAt: announcements.createdAt,
-                authorName: user.name,
-            })
-            .from(announcements)
-            .innerJoin(user, eq(announcements.authorId, user.id))
-            .orderBy(desc(announcements.createdAt))
-            .limit(5);
-
-        const recentAssignments = await db
-            .select({
-                id: assignments.id,
-                title: assignments.title,
-                createdAt: assignments.createdAt,
-                className: classes.name,
-            })
-            .from(assignments)
-            .innerJoin(classes, eq(assignments.classId, classes.id))
-            .orderBy(desc(assignments.createdAt))
-            .limit(5);
-
-        const recentSubmissions = await db
-            .select({
-                id: submissions.id,
-                createdAt: submissions.submittedAt,
-                studentName: user.name,
-                assignmentTitle: assignments.title,
-            })
-            .from(submissions)
-            .innerJoin(user, eq(submissions.studentId, user.id))
-            .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
-            .orderBy(desc(submissions.submittedAt))
-            .limit(5);
+        const [recentAnnouncements, recentAssignments, recentSubmissions] = await Promise.all([
+            db
+                .select({
+                    id: announcements.id,
+                    title: announcements.title,
+                    createdAt: announcements.createdAt,
+                    authorName: user.name,
+                })
+                .from(announcements)
+                .innerJoin(user, eq(announcements.authorId, user.id))
+                .orderBy(desc(announcements.createdAt))
+                .limit(5),
+            db
+                .select({
+                    id: assignments.id,
+                    title: assignments.title,
+                    createdAt: assignments.createdAt,
+                    className: classes.name,
+                })
+                .from(assignments)
+                .innerJoin(classes, eq(assignments.classId, classes.id))
+                .orderBy(desc(assignments.createdAt))
+                .limit(5),
+            db
+                .select({
+                    id: submissions.id,
+                    createdAt: submissions.submittedAt,
+                    studentName: user.name,
+                    assignmentTitle: assignments.title,
+                })
+                .from(submissions)
+                .innerJoin(user, eq(submissions.studentId, user.id))
+                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .orderBy(desc(submissions.submittedAt))
+                .limit(5),
+        ]);
 
         const feed = [
             ...recentAnnouncements.map((a) => ({

@@ -100,31 +100,11 @@ router.get("/", requireAuth, async (req, res) => {
             );
         }
 
-        const rawEvents = await db
-            .select({
-                ...getTableColumns(calendarEvents),
-                class: { id: classes.id, name: classes.name },
-                creator: { id: user.id, name: user.name },
-            })
-            .from(calendarEvents)
-            .leftJoin(classes, eq(calendarEvents.classId, classes.id))
-            .innerJoin(user, eq(calendarEvents.createdBy, user.id))
-            .where(conditions.length > 0 ? and(...conditions) : undefined)
-            .orderBy(calendarEvents.startAt);
-
-        const events = rawEvents.flatMap((e) => expandOccurrences(e, rangeStart, rangeEnd));
-
         // Auto-include exams in range as calendar items
         const examConditions = [];
         if (from && DATE_RE.test(from)) examConditions.push(gte(exams.scheduledAt, new Date(from)));
         if (to && DATE_RE.test(to)) examConditions.push(lte(exams.scheduledAt, new Date(to + "T23:59:59")));
         if (classId) examConditions.push(eq(exams.classId, Number(classId)));
-
-        const examEvents = await db
-            .select({ id: exams.id, title: exams.title, scheduledAt: exams.scheduledAt, classId: exams.classId, className: classes.name })
-            .from(exams)
-            .leftJoin(classes, eq(exams.classId, classes.id))
-            .where(examConditions.length > 0 ? and(...examConditions) : undefined);
 
         // Auto-include assignment deadlines in range
         const assignConditions = [];
@@ -132,11 +112,31 @@ router.get("/", requireAuth, async (req, res) => {
         if (to && DATE_RE.test(to)) assignConditions.push(lte(assignments.dueAt, new Date(to + "T23:59:59")));
         if (classId) assignConditions.push(eq(assignments.classId, Number(classId)));
 
-        const deadlines = await db
-            .select({ id: assignments.id, title: assignments.title, dueAt: assignments.dueAt, classId: assignments.classId, className: classes.name })
-            .from(assignments)
-            .leftJoin(classes, eq(assignments.classId, classes.id))
-            .where(assignConditions.length > 0 ? and(...assignConditions) : undefined);
+        const [rawEvents, examEvents, deadlines] = await Promise.all([
+            db
+                .select({
+                    ...getTableColumns(calendarEvents),
+                    class: { id: classes.id, name: classes.name },
+                    creator: { id: user.id, name: user.name },
+                })
+                .from(calendarEvents)
+                .leftJoin(classes, eq(calendarEvents.classId, classes.id))
+                .innerJoin(user, eq(calendarEvents.createdBy, user.id))
+                .where(conditions.length > 0 ? and(...conditions) : undefined)
+                .orderBy(calendarEvents.startAt),
+            db
+                .select({ id: exams.id, title: exams.title, scheduledAt: exams.scheduledAt, classId: exams.classId, className: classes.name })
+                .from(exams)
+                .leftJoin(classes, eq(exams.classId, classes.id))
+                .where(examConditions.length > 0 ? and(...examConditions) : undefined),
+            db
+                .select({ id: assignments.id, title: assignments.title, dueAt: assignments.dueAt, classId: assignments.classId, className: classes.name })
+                .from(assignments)
+                .leftJoin(classes, eq(assignments.classId, classes.id))
+                .where(assignConditions.length > 0 ? and(...assignConditions) : undefined),
+        ]);
+
+        const events = rawEvents.flatMap((e) => expandOccurrences(e, rangeStart, rangeEnd));
 
         const merged = [
             ...events.map((e) => ({ ...e, source: "manual" as const })),

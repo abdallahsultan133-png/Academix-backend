@@ -93,28 +93,29 @@ router.get("/", requireAuth, async (req, res) => {
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
 
-        const countResult = await db
-            .select({ count: sql<number>`count(*)`})
-            .from(classes)
-            .leftJoin(subjects, eq(classes.subjectId, subjects.id))
-            .leftJoin(user, eq(classes.teacherId, user.id))
-            .where(whereClause);
+        const [countResult, classesList] = await Promise.all([
+            db
+                .select({ count: sql<number>`count(*)`})
+                .from(classes)
+                .leftJoin(subjects, eq(classes.subjectId, subjects.id))
+                .leftJoin(user, eq(classes.teacherId, user.id))
+                .where(whereClause),
+            db
+                .select({
+                    ...getTableColumns(classes),
+                    subject: { ...getTableColumns(subjects) },
+                    teacher: { ...getTableColumns(user) }
+                })
+                .from(classes)
+                .leftJoin(subjects, eq(classes.subjectId, subjects.id))
+                .leftJoin(user, eq(classes.teacherId, user.id))
+                .where(whereClause)
+                .orderBy(desc(classes.createdAt))
+                .limit(limitPerPage)
+                .offset(offset),
+        ]);
 
         const totalCount = countResult[0]?.count ?? 0;
-
-        const classesList = await db
-            .select({
-                ...getTableColumns(classes),
-                subject: { ...getTableColumns(subjects) },
-                teacher: { ...getTableColumns(user) }
-            })
-            .from(classes)
-            .leftJoin(subjects, eq(classes.subjectId, subjects.id))
-            .leftJoin(user, eq(classes.teacherId, user.id))
-            .where(whereClause)
-            .orderBy(desc(classes.createdAt))
-            .limit(limitPerPage)
-            .offset(offset);
 
         res.status(200).json({
             data: classesList,

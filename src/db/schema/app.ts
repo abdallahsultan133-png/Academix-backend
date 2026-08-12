@@ -43,7 +43,9 @@ export const subjects = pgTable('subjects', {
     // admin) may edit — see the ownership check in routes/subjects.ts.
     createdBy: text('created_by').references(() => user.id, { onDelete: 'set null' }),
     ...timestamps
-});
+}, (table) => [
+    index('subjects_department_id_idx').on(table.departmentId),
+]);
 
 export const classes = pgTable('classes', {
     id: integer('id').primaryKey().generatedAlwaysAsIdentity(),

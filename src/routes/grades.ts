@@ -162,41 +162,40 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid classId" });
 
-        // All enrolled students
-        const roster = await db
-            .select({ studentId: user.id, name: user.name, email: user.email, image: user.image })
-            .from(enrollments)
-            .innerJoin(user, eq(enrollments.studentId, user.id))
-            .where(eq(enrollments.classId, classId))
-            .orderBy(user.name);
-
-        // Assignment averages
-        const assignmentAvgs = await db
-            .select({
-                studentId: submissions.studentId,
-                avg: avg(sql<number>`(${submissions.score}::float / NULLIF(${assignments.maxScore}, 0)) * 100`),
-            })
-            .from(submissions)
-            .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
-            .where(and(eq(assignments.classId, classId), eq(submissions.status, "graded")))
-            .groupBy(submissions.studentId);
-
-        // Exam averages
-        const examAvgs = await db
-            .select({
-                studentId: examResults.studentId,
-                avg: avg(sql<number>`(${examResults.score}::float / NULLIF(${exams.maxScore}, 0)) * 100`),
-            })
-            .from(examResults)
-            .innerJoin(exams, eq(examResults.examId, exams.id))
-            .where(eq(exams.classId, classId))
-            .groupBy(examResults.studentId);
-
-        // Existing saved grades
-        const savedGrades = await db
-            .select()
-            .from(classGrades)
-            .where(eq(classGrades.classId, classId));
+        const [roster, assignmentAvgs, examAvgs, savedGrades] = await Promise.all([
+            // All enrolled students
+            db
+                .select({ studentId: user.id, name: user.name, email: user.email, image: user.image })
+                .from(enrollments)
+                .innerJoin(user, eq(enrollments.studentId, user.id))
+                .where(eq(enrollments.classId, classId))
+                .orderBy(user.name),
+            // Assignment averages
+            db
+                .select({
+                    studentId: submissions.studentId,
+                    avg: avg(sql<number>`(${submissions.score}::float / NULLIF(${assignments.maxScore}, 0)) * 100`),
+                })
+                .from(submissions)
+                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .where(and(eq(assignments.classId, classId), eq(submissions.status, "graded")))
+                .groupBy(submissions.studentId),
+            // Exam averages
+            db
+                .select({
+                    studentId: examResults.studentId,
+                    avg: avg(sql<number>`(${examResults.score}::float / NULLIF(${exams.maxScore}, 0)) * 100`),
+                })
+                .from(examResults)
+                .innerJoin(exams, eq(examResults.examId, exams.id))
+                .where(eq(exams.classId, classId))
+                .groupBy(examResults.studentId),
+            // Existing saved grades
+            db
+                .select()
+                .from(classGrades)
+                .where(eq(classGrades.classId, classId)),
+        ]);
 
         const aMap = Object.fromEntries(assignmentAvgs.map((r) => [r.studentId, Math.round(Number(r.avg) || 0)]));
         const eMap = Object.fromEntries(examAvgs.map((r) => [r.studentId, Math.round(Number(r.avg) || 0)]));

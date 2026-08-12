@@ -41,23 +41,24 @@ router.get("/", requireAuth, async (req, res) => {
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
 
-        const countResult = await db
-            .select({ count: sql<number>`count(*)`})
-            .from(subjects)
-            .leftJoin(departments, eq(subjects.departmentId, departments.id))
-            .where(whereClause);
+        const [countResult, subjectsList] = await Promise.all([
+            db
+                .select({ count: sql<number>`count(*)`})
+                .from(subjects)
+                .leftJoin(departments, eq(subjects.departmentId, departments.id))
+                .where(whereClause),
+            db
+                .select({
+                    ...getTableColumns(subjects),
+                    department: { ...getTableColumns(departments) }
+                }).from(subjects).leftJoin(departments, eq(subjects.departmentId, departments.id))
+                .where(whereClause)
+                .orderBy(desc(subjects.createdAt))
+                .limit(limitPerPage)
+                .offset(offset),
+        ]);
 
         const totalCount = countResult[0]?.count ?? 0;
-
-        const subjectsList = await db
-            .select({
-                ...getTableColumns(subjects),
-                department: { ...getTableColumns(departments) }
-            }).from(subjects).leftJoin(departments, eq(subjects.departmentId, departments.id))
-            .where(whereClause)
-            .orderBy(desc(subjects.createdAt))
-            .limit(limitPerPage)
-            .offset(offset);
 
         res.status(200).json({
             data: subjectsList,
