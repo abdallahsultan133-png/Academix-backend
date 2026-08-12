@@ -15,6 +15,16 @@ export const auth = betterAuth({
     baseURL: process.env.BETTER_AUTH_URL!,
     secret: process.env.BETTER_AUTH_SECRET!,
     trustedOrigins: [process.env.FRONTEND_URL!],
+
+    // Frontend (Netlify) and backend (Railway) are separate domains, so the
+    // session cookie must be SameSite=None to be sent on cross-site fetch
+    // requests — the default "lax" is only sent on top-level navigations.
+    advanced: {
+        defaultCookieAttributes: {
+            sameSite: "none",
+            secure: true,
+        },
+    },
     database: drizzleAdapter(db, {
         provider: "pg",
         schema,
