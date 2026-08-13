@@ -1,5 +1,5 @@
 import express from "express";
-import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { attendance, classes, enrollments, qrSessions } from "../db/schema/app.js";
@@ -8,7 +8,7 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { markAttendanceSchema, qrGenerateSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass, canAccessStudent } from "../lib/access-control.js";
+import { canAccessClass, canAccessStudent, getLinkedChildIds } from "../lib/access-control.js";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -128,10 +128,27 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
             if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
         }
 
+        let childIds: string[] = [];
+        if (req.user!.role === "parent") {
+            childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
+            const [childEnrolled] = childIds.length > 0
+                ? await db
+                    .select({ studentId: enrollments.studentId })
+                    .from(enrollments)
+                    .where(and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds)))
+                : [];
+            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+        }
+
         const { from, to } = req.query as { from?: string; to?: string };
         const conditions = [eq(attendance.classId, classId)];
         if (from && DATE_RE.test(from)) conditions.push(gte(attendance.date, from));
         if (to && DATE_RE.test(to)) conditions.push(lte(attendance.date, to));
+
+        const rosterScope =
+            req.user!.role === "student" ? and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!))
+            : req.user!.role === "parent" ? and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds))
+            : eq(enrollments.classId, classId);
 
         const rows = await db
             .select({
@@ -147,11 +164,7 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
             .from(enrollments)
             .innerJoin(user, eq(enrollments.studentId, user.id))
             .leftJoin(attendance, and(eq(attendance.studentId, enrollments.studentId), ...conditions))
-            .where(
-                req.user!.role === "student"
-                    ? and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!))
-                    : eq(enrollments.classId, classId)
-            )
+            .where(rosterScope)
             .groupBy(user.id, user.name, user.email)
             .orderBy(user.name);
 

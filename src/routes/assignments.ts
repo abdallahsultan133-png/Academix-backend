@@ -1,5 +1,5 @@
 import express from "express";
-import { and, desc, eq, getTableColumns, gte, lte } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, gte, inArray, lte, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { assignments, classes, enrollments, submissions } from "../db/schema/app.js";
@@ -10,7 +10,8 @@ import { createAssignmentSchema, updateAssignmentSchema, submitAssignmentSchema,
 import { notifyEnrolledStudents, notifyStudent } from "./notifications.js";
 import { sendAssignmentEmail, sendGradeEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass } from "../lib/access-control.js";
+import { canAccessClass, getLinkedChildIds } from "../lib/access-control.js";
+import { runAiDetection } from "../lib/ai-detector.js";
 
 const router = express.Router();
 
@@ -27,8 +28,23 @@ router.get("/", requireAuth, async (req, res) => {
         const conditions = [];
         if (classId) conditions.push(eq(assignments.classId, Number(classId)));
         // A teacher only sees assignments for classes they teach — not every
-        // teacher's. Admins, parents, and super_admins see everything.
+        // teacher's. Admins and super_admins see everything.
         if (req.user!.role === "teacher") conditions.push(eq(classes.teacherId, req.user!.id!));
+
+        // A parent only sees assignments for classes their own linked
+        // children are enrolled in — not every class in the school.
+        if (req.user!.role === "parent") {
+            const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
+            const childClassIds = childIds.length > 0
+                ? [...new Set((await db
+                    .select({ classId: enrollments.classId })
+                    .from(enrollments)
+                    .where(inArray(enrollments.studentId, childIds))
+                ).map((r) => r.classId))]
+                : [];
+            conditions.push(childClassIds.length > 0 ? inArray(assignments.classId, childClassIds) : sql`false`);
+        }
+
         const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
         const list = await db
@@ -71,6 +87,17 @@ router.get("/:id", requireAuth, async (req, res) => {
             .where(eq(assignments.id, id));
 
         if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+
+        if (req.user!.role === "parent") {
+            const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
+            const [childEnrolled] = childIds.length > 0
+                ? await db
+                    .select({ studentId: enrollments.studentId })
+                    .from(enrollments)
+                    .where(and(eq(enrollments.classId, assignment.classId), inArray(enrollments.studentId, childIds)))
+                : [];
+            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+        }
 
         let mySubmission = null;
         if (req.user?.role === "student" && req.user.id) {
@@ -250,7 +277,12 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
             .where(and(eq(enrollments.classId, assignment.classId), eq(enrollments.studentId, req.user!.id!)));
         if (!enrollment) return res.status(403).json({ error: "You are not enrolled in this class." });
 
-        const isLate = assignment.dueAt ? new Date() > assignment.dueAt : false;
+        // Once the deadline passes, submission is closed entirely — no more
+        // late submissions accepted.
+        if (assignment.dueAt && new Date() > assignment.dueAt) {
+            return res.status(403).json({ error: "The deadline for this assignment has passed. You can no longer submit." });
+        }
+
         const studentId = req.user!.id!;
 
         const [result] = await db
@@ -262,7 +294,7 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
                 fileUrl: fileUrl ?? null,
                 fileCldPubId: fileCldPubId ?? null,
                 fileName: fileName ?? null,
-                status: isLate ? "late" : "submitted",
+                status: "submitted",
                 submittedAt: new Date(),
             })
             .onConflictDoUpdate({
@@ -272,17 +304,23 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
                     fileUrl: fileUrl ?? null,
                     fileCldPubId: fileCldPubId ?? null,
                     fileName: fileName ?? null,
-                    status: isLate ? "late" : "submitted",
+                    status: "submitted",
                     submittedAt: new Date(),
                     updatedAt: new Date(),
-                    // resubmitting clears any previous grade
+                    // resubmitting clears any previous grade and AI-detection result
                     score: null,
                     feedback: null,
                     gradedBy: null,
                     gradedAt: null,
+                    aiScore: null,
+                    aiSummary: null,
                 },
             })
             .returning();
+
+        if (result && content) {
+            void runAiDetection(result.id, content);
+        }
 
         res.status(200).json({ data: result });
     } catch (e) {

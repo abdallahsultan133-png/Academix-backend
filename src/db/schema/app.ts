@@ -122,6 +122,11 @@ export const submissions = pgTable('submissions', {
     gradedBy: text('graded_by').references(() => user.id, { onDelete: 'set null' }),
     gradedAt: timestamp('graded_at'),
     submittedAt: timestamp('submitted_at').defaultNow().notNull(),
+    // AI-generated-content likelihood, filled in asynchronously after submit
+    // (see lib/ai-detector.ts) — null until analysis completes, or forever
+    // if there was no text content to analyze or detection is unconfigured.
+    aiScore: integer('ai_score'),
+    aiSummary: text('ai_summary'),
     ...timestamps
 }, (table) => [
     unique('submissions_assignment_id_student_id_unique').on(table.assignmentId, table.studentId),

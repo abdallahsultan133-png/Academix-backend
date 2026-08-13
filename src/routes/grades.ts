@@ -1,5 +1,5 @@
 import express from "express";
-import { and, avg, desc, eq, getTableColumns, sql } from "drizzle-orm";
+import { and, avg, desc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { assignments, classGrades, classes, enrollments, examResults, exams, submissions } from "../db/schema/app.js";
@@ -8,7 +8,7 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createExamSchema, examResultsSchema, gradebookSaveSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass, canAccessStudent } from "../lib/access-control.js";
+import { canAccessClass, canAccessStudent, getLinkedChildIds } from "../lib/access-control.js";
 
 const router = express.Router();
 
@@ -204,6 +204,18 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
         }
 
+        let childIds: string[] = [];
+        if (req.user!.role === "parent") {
+            childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
+            const [childEnrolled] = childIds.length > 0
+                ? await db
+                    .select({ studentId: enrollments.studentId })
+                    .from(enrollments)
+                    .where(and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds)))
+                : [];
+            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+        }
+
         const [roster, assignmentAvgs, examAvgs, savedGrades] = await Promise.all([
             // All enrolled students
             db
@@ -277,10 +289,13 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             };
         });
 
-        // A student only sees their own row, never the rest of the class's grades.
+        // A student only sees their own row; a parent only their linked
+        // children's rows — never the rest of the class's grades.
         const visible = req.user!.role === "student"
             ? gradebook.filter((row) => row.studentId === req.user!.id)
-            : gradebook;
+            : req.user!.role === "parent"
+                ? gradebook.filter((row) => childIds.includes(row.studentId))
+                : gradebook;
 
         res.json({ data: visible });
     } catch (e) {

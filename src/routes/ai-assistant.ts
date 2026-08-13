@@ -19,17 +19,9 @@ import { requireAuth, requireRole } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { aiChatSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
+import { getAnthropicClient } from "../lib/anthropic.js";
 
 const router = express.Router();
-
-// ─── ANTHROPIC CLIENT (lazy — the key may not be set yet) ─────────────────────
-let anthropicClient: Anthropic | null = null;
-function getAnthropicClient(): Anthropic | null {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return null;
-    if (!anthropicClient) anthropicClient = new Anthropic({ apiKey });
-    return anthropicClient;
-}
 
 // ─── DATA-GATHERING HELPERS (mirror profile.ts's /student/:studentId, extended) ─
 async function searchStudents(query: string) {

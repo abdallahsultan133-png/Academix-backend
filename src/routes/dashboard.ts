@@ -115,46 +115,23 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
 });
 
 // GET /api/dashboard/recent-activity
-// Merges the most recent announcements, assignments, and submissions into one feed.
-// Scoped to the teacher's own classes for teachers; org-wide for everyone else.
-dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
+// Merges the most recent announcements, assignments, and submissions into one
+// feed. Org-wide for every role, including teachers — everyone sees what
+// everyone else has been doing, not just their own classes.
+dashboardRouter.get("/recent-activity", requireAuth, async (_req, res) => {
     try {
-        const isTeacher = req.user?.role === "teacher";
-        const teacherId = req.user?.id;
-        const teacherScope = isTeacher && teacherId ? eq(classes.teacherId, teacherId) : undefined;
-
-        // announcements.classId is nullable (school-wide announcements have no
-        // class), so only join classes when actually scoping to a teacher —
-        // an unconditional inner join would silently drop school-wide
-        // announcements from the org-wide (admin) feed too.
-        const announcementsQuery = teacherScope
-            ? db
-                .select({
-                    id: announcements.id,
-                    title: announcements.title,
-                    createdAt: announcements.createdAt,
-                    authorName: user.name,
-                })
-                .from(announcements)
-                .innerJoin(user, eq(announcements.authorId, user.id))
-                .innerJoin(classes, eq(announcements.classId, classes.id))
-                .where(teacherScope)
-                .orderBy(desc(announcements.createdAt))
-                .limit(5)
-            : db
-                .select({
-                    id: announcements.id,
-                    title: announcements.title,
-                    createdAt: announcements.createdAt,
-                    authorName: user.name,
-                })
-                .from(announcements)
-                .innerJoin(user, eq(announcements.authorId, user.id))
-                .orderBy(desc(announcements.createdAt))
-                .limit(5);
-
         const [recentAnnouncements, recentAssignments, recentSubmissions] = await Promise.all([
-            announcementsQuery,
+            db
+                .select({
+                    id: announcements.id,
+                    title: announcements.title,
+                    createdAt: announcements.createdAt,
+                    authorName: user.name,
+                })
+                .from(announcements)
+                .innerJoin(user, eq(announcements.authorId, user.id))
+                .orderBy(desc(announcements.createdAt))
+                .limit(5),
             db
                 .select({
                     id: assignments.id,
@@ -164,7 +141,6 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 })
                 .from(assignments)
                 .innerJoin(classes, eq(assignments.classId, classes.id))
-                .where(teacherScope)
                 .orderBy(desc(assignments.createdAt))
                 .limit(5),
             db
@@ -177,8 +153,6 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 .from(submissions)
                 .innerJoin(user, eq(submissions.studentId, user.id))
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
-                .innerJoin(classes, eq(assignments.classId, classes.id))
-                .where(teacherScope)
                 .orderBy(desc(submissions.submittedAt))
                 .limit(5),
         ]);

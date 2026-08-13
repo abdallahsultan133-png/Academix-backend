@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, ilike, or } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { classes, enrollments, studentProfiles } from "../db/schema/app.js";
 
@@ -60,4 +60,24 @@ export async function canAccessClass(
         .from(classes)
         .where(and(eq(classes.id, classId), eq(classes.teacherId, caller.id)));
     return !!owned;
+}
+
+/**
+ * The student user IDs a parent is linked to — via studentProfiles.parentUserId
+ * (the authoritative, admin-set link) or the legacy parentEmail match for
+ * profiles an admin hasn't linked yet. Used to scope a parent's view of
+ * attendance, grades, and assignments to only their own children.
+ */
+export async function getLinkedChildIds(
+    caller: { id: string; email?: string | undefined }
+): Promise<string[]> {
+    const conditions = [eq(studentProfiles.parentUserId, caller.id)];
+    if (caller.email) conditions.push(ilike(studentProfiles.parentEmail, caller.email));
+
+    const rows = await db
+        .select({ userId: studentProfiles.userId })
+        .from(studentProfiles)
+        .where(or(...conditions));
+
+    return [...new Set(rows.map((r) => r.userId))];
 }
