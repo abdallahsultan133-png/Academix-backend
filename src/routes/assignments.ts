@@ -285,6 +285,16 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
 
         const studentId = req.user!.id!;
 
+        // A submission is final — once it exists, it can't be resubmitted or
+        // overwritten (by the student; a teacher regrading is unaffected).
+        const [existingSubmission] = await db
+            .select({ id: submissions.id })
+            .from(submissions)
+            .where(and(eq(submissions.assignmentId, assignmentId), eq(submissions.studentId, studentId)));
+        if (existingSubmission) {
+            return res.status(409).json({ error: "You've already submitted this assignment. Resubmitting isn't allowed." });
+        }
+
         const [result] = await db
             .insert(submissions)
             .values({
@@ -296,25 +306,6 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
                 fileName: fileName ?? null,
                 status: "submitted",
                 submittedAt: new Date(),
-            })
-            .onConflictDoUpdate({
-                target: [submissions.assignmentId, submissions.studentId],
-                set: {
-                    content: content ?? null,
-                    fileUrl: fileUrl ?? null,
-                    fileCldPubId: fileCldPubId ?? null,
-                    fileName: fileName ?? null,
-                    status: "submitted",
-                    submittedAt: new Date(),
-                    updatedAt: new Date(),
-                    // resubmitting clears any previous grade and AI-detection result
-                    score: null,
-                    feedback: null,
-                    gradedBy: null,
-                    gradedAt: null,
-                    aiScore: null,
-                    aiSummary: null,
-                },
             })
             .returning();
 
