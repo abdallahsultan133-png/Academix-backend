@@ -1,0 +1,5 @@
+{
+  "licenceKey": "<your-site24x7-apm-insight-licence-key>",
+  "appName": "classroom-backend",
+  "port": 10000
+}
