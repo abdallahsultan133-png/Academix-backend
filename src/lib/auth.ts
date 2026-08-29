@@ -2,7 +2,7 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { db } from "../db/index.js";
 import * as schema from '../db/schema/auth.js'
-import { sendWelcomeEmail } from "./email.js";
+import { sendWelcomeEmail, sendPasswordResetEmail } from "./email.js";
 
 // Only register the Google provider once real credentials are present —
 // betterAuth() throws at startup if a social provider is configured with an
@@ -32,6 +32,15 @@ export const auth = betterAuth({
 
     emailAndPassword: {
         enabled: true,
+        // Forgot-password flow. `url` is Better Auth's own reset link — clicking
+        // it verifies the token server-side, then redirects the browser to
+        // `${FRONTEND_URL}/reset-password?token=...` (the `redirectTo` the
+        // frontend passes to forgetPassword). If RESEND_API_KEY isn't set the
+        // email silently no-ops (see lib/email.ts).
+        resetPasswordTokenExpiresIn: 60 * 60, // 1 hour
+        sendResetPassword: async ({ user, url }) => {
+            await sendPasswordResetEmail({ to: user.email, name: user.name, resetUrl: url });
+        },
     },
 
     account: {

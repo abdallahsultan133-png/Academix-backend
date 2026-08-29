@@ -2,13 +2,13 @@ import express from "express";
 import {and, desc, eq, getTableColumns, ilike, or, sql} from "drizzle-orm";
 
 import {db} from "../db/index.js";
-import {classes, departments, subjects, enrollments, studentProfiles} from '../db/schema/app.js'
+import {classes, departments, subjects, enrollments} from '../db/schema/app.js'
 import { user } from '../db/schema/auth.js'
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createClassSchema, updateClassSchema, enrollSchema, joinClassSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -91,12 +91,10 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(user.name, teacherPattern));
         }
 
-        // A teacher only sees the classes they teach themselves — not every
-        // teacher's classes. Admins, parents, and super_admins see everything;
-        // students keep browsing/joining the full catalog as before.
-        if (req.user!.role === "teacher") {
-            filterConditions.push(eq(classes.teacherId, req.user!.id!));
-        }
+        // Row-level list scoping (policy): a teacher only sees the classes they
+        // teach; admins, parents, students see the full catalogue.
+        const scope = policy.teacherClassScope(req.user!);
+        if (scope) filterConditions.push(scope);
 
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
@@ -171,12 +169,12 @@ router.get('/:id', requireAuth, async (req, res) => {
     res.status(200).json({ data: classDetails });
 })
 
-router.post('/', requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createClassSchema), async (req, res) => {
+router.post('/', requireAuth, requireRole(...STAFF_ROLES), validateBody(createClassSchema), async (req, res) => {
     try {
         // A teacher can only create a class taught by themselves — the body's
         // teacherId is ignored for that role so they can't assign a class to
         // (or see it show up under) another teacher. Admins may assign anyone.
-        const teacherId = req.user!.role === "teacher" ? req.user!.id! : req.body.teacherId;
+        const teacherId = policy.isTeacher(req.user!) ? req.user!.id! : req.body.teacherId;
 
         const [createdClass] = await db
             .insert(classes)
@@ -194,15 +192,15 @@ router.post('/', requireAuth, requireRole("teacher", "admin", "super_admin"), va
 })
 
 // PUT /api/classes/:id — teacher (of that class)/admin only
-router.put('/:id', requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(updateClassSchema), async (req, res) => {
+router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(updateClassSchema), async (req, res) => {
     try {
         const classId = Number(req.params.id);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: 'Invalid class id' });
 
         const [existing] = await db.select().from(classes).where(eq(classes.id, classId));
         if (!existing) return res.status(404).json({ error: 'Class not found.' });
-        if (existing.teacherId !== req.user!.id && req.user!.role !== "admin" && req.user!.role !== "super_admin") {
-            return res.status(403).json({ error: "You can only edit classes you teach." });
+        if (!policy.ownsOrAdmin(req.user!, existing.teacherId)) {
+            return policy.forbidden(res, "You can only edit classes you teach.");
         }
 
         const { name, subjectId, teacherId, description, capacity, bannerUrl, bannerCldPubId, status } = req.body as {
@@ -213,7 +211,7 @@ router.put('/:id', requireAuth, requireRole("teacher", "admin", "super_admin"), 
 
         // Only an admin may reassign a class to a different teacher — a
         // teacher editing their own class can't hand it off to someone else.
-        const isAdmin = req.user!.role === "admin" || req.user!.role === "super_admin";
+        const isAdmin = policy.isAdmin(req.user!);
 
         const [updated] = await db
             .update(classes)
@@ -239,7 +237,7 @@ router.put('/:id', requireAuth, requireRole("teacher", "admin", "super_admin"), 
 });
 
 // DELETE /api/classes/:id — admin only (destructive: cascades to enrollments, attendance, assignments, etc.)
-router.delete('/:id', requireAuth, requireRole("admin", "super_admin"), async (req, res) => {
+router.delete('/:id', requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
     try {
         const classId = Number(req.params.id);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: 'Invalid class id' });
@@ -267,29 +265,24 @@ router.get('/:id/students', requireAuth, async (req, res) => {
         if (!Number.isFinite(classId)) return res.status(400).json({ error: 'Invalid class id' });
 
         const caller = req.user!;
-        const isAdmin = caller.role === "admin" || caller.role === "super_admin";
 
-        if (caller.role === "teacher" && !(await canAccessClass(caller, classId))) {
-            return res.status(403).json({ error: "You can only view rosters for classes you teach." });
-        }
-
-        if (!isAdmin && caller.role !== "teacher") {
-            if (caller.role === "student") {
-                const [own] = await db
-                    .select({ studentId: enrollments.studentId })
-                    .from(enrollments)
-                    .where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, caller.id!)));
-                if (!own) return res.status(403).json({ error: "You're not enrolled in this class." });
-            } else if (caller.role === "parent") {
-                const [child] = await db
-                    .select({ studentId: enrollments.studentId })
-                    .from(enrollments)
-                    .innerJoin(studentProfiles, eq(studentProfiles.userId, enrollments.studentId))
-                    .where(and(eq(enrollments.classId, classId), eq(studentProfiles.parentUserId, caller.id!)));
-                if (!child) return res.status(403).json({ error: "You don't have a child enrolled in this class." });
-            } else {
-                return res.status(403).json({ error: "You don't have permission to view this roster." });
+        // Roster visibility (policy): teacher-of-class, enrolled student,
+        // linked parent with a child in the class, or any admin.
+        if (policy.isTeacher(caller)) {
+            if (!(await policy.canManageClass(caller, classId))) {
+                return policy.forbidden(res, "You can only view rosters for classes you teach.");
             }
+        } else if (policy.isStudent(caller)) {
+            if (!(await policy.isEnrolledInClass(caller.id!, classId))) {
+                return policy.forbidden(res, "You're not enrolled in this class.");
+            }
+        } else if (policy.isParent(caller)) {
+            const childIds = await policy.getLinkedChildIds({ id: caller.id!, email: caller.email });
+            if (!(await policy.anyChildEnrolledInClass(childIds, classId))) {
+                return policy.forbidden(res, "You don't have a child enrolled in this class.");
+            }
+        } else if (!policy.isAdmin(caller)) {
+            return policy.forbidden(res, "You don't have permission to view this roster.");
         }
 
         const roster = await db
@@ -306,12 +299,12 @@ router.get('/:id/students', requireAuth, async (req, res) => {
 });
 
 // POST /api/classes/:id/enroll — enroll a student by email or userId
-router.post('/:id/enroll', requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(enrollSchema), async (req, res) => {
+router.post('/:id/enroll', requireAuth, requireRole(...STAFF_ROLES), validateBody(enrollSchema), async (req, res) => {
     try {
         const classId = Number(req.params.id);
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only enroll students into classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only enroll students into classes you teach.");
         }
 
         const { studentId, email } = req.body as { studentId?: string; email?: string };
@@ -333,12 +326,12 @@ router.post('/:id/enroll', requireAuth, requireRole("teacher", "admin", "super_a
 });
 
 // DELETE /api/classes/:id/enroll/:studentId — remove a student
-router.delete('/:id/enroll/:studentId', requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+router.delete('/:id/enroll/:studentId', requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const classId = Number(req.params.id);
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only remove students from classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only remove students from classes you teach.");
         }
 
         const studentId = String(req.params.studentId ?? "");

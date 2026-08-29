@@ -162,6 +162,13 @@ export const updateRoleSchema = z.object({
     role: z.enum(["student", "teacher", "admin", "parent", "super_admin"]),
 });
 
+// Admin-initiated password reset. "email" mails the user a reset link (the same
+// one /forgot-password sends); "temporary" sets a generated one-time password
+// the admin reads back once and hands to the user in person.
+export const adminResetPasswordSchema = z.object({
+    mode: z.enum(["email", "temporary"]),
+});
+
 export const linkParentSchema = z.object({
     // Pass an email to link that user (must already have role "parent") as this
     // student's parent; pass null to unlink.
@@ -189,6 +196,17 @@ export const aiChatSchema = z.object({
         )
         .max(40)
         .optional(),
+});
+
+// Display photo (avatar). `url` must be a Cloudinary-hosted image; `null` clears
+// the photo and falls back to initials. `publicId` is Cloudinary's handle for
+// the asset, kept so the image can be transformed/removed later.
+export const updateAvatarSchema = z.object({
+    url: z.union([
+        z.string().regex(/^https:\/\/[a-z0-9.-]+\.cloudinary\.com\/.+/i, "must be a Cloudinary URL"),
+        z.null(),
+    ]),
+    publicId: z.union([z.string().max(300), z.null()]).optional(),
 });
 
 export const updateProfileSchema = z.object({

@@ -3,10 +3,11 @@ import {and, desc, eq, getTableColumns, ilike, or, sql} from "drizzle-orm";
 
 import {departments, subjects} from "../db/schema/index.js";
 import { db } from "../db/index.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createSubjectSchema, updateSubjectSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -38,11 +39,14 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(departments.name, deptPattern));
         }
 
-        // A teacher only sees the subjects they created themselves — not the
-        // whole school's. Admins, parents, and super_admins see everything.
-        if (req.user!.role === "teacher") {
-            filterConditions.push(eq(subjects.createdBy, req.user!.id!));
-        }
+        // Subjects are shared reference data (name / code / department only — no
+        // student or grade data), so every authenticated role reads the full
+        // catalogue: students browse it, teachers need it to create and filter
+        // classes. Write access stays scoped — PUT /subjects/:id only lets the
+        // creating teacher or an admin edit, and DELETE is admin-only — so
+        // there's nothing to protect by hiding the list from teachers. (Doing
+        // so just left teachers with an empty Subjects page and no subjects to
+        // pick when creating a class.)
 
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
@@ -83,7 +87,7 @@ router.get("/", requireAuth, async (req, res) => {
 })
 
 // POST /api/subjects — admin/teacher only
-router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createSubjectSchema), async (req, res) => {
+router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createSubjectSchema), async (req, res) => {
     try {
         const { name, code, description, departmentId } = req.body as {
             name: string; code: string; description?: string | null; departmentId: number;
@@ -105,7 +109,7 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
 
 // PUT /api/subjects/:id — admin/super_admin can edit any subject; a teacher
 // may only edit a subject they created themselves (not just any teacher).
-router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(updateSubjectSchema), async (req, res) => {
+router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(updateSubjectSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid subject id" });
@@ -113,9 +117,8 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
         const [existing] = await db.select({ createdBy: subjects.createdBy }).from(subjects).where(eq(subjects.id, id));
         if (!existing) return res.status(404).json({ error: "Subject not found" });
 
-        const isAdmin = req.user!.role === "admin" || req.user!.role === "super_admin";
-        if (!isAdmin && existing.createdBy !== req.user!.id) {
-            return res.status(403).json({ error: "Only the teacher who created this subject (or an admin) can edit it." });
+        if (!policy.ownsOrAdmin(req.user!, existing.createdBy)) {
+            return policy.forbidden(res, "Only the teacher who created this subject (or an admin) can edit it.");
         }
 
         const { name, code, description, departmentId } = req.body as {
@@ -143,7 +146,7 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
 });
 
 // DELETE /api/subjects/:id — admin only (subjects cascade-delete their classes, so this is destructive)
-router.delete("/:id", requireAuth, requireRole("admin", "super_admin"), async (req, res) => {
+router.delete("/:id", requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid subject id" });

@@ -1,6 +1,9 @@
 import type { Request, Response, NextFunction } from "express";
 import { fromNodeHeaders } from "better-auth/node";
 import { auth } from "../lib/auth.js";
+import { forbidden, unauthorized } from "../lib/policy.js";
+
+export { ADMIN_ROLES, STAFF_ROLES } from "../lib/policy.js";
 
 /**
  * Resolves the Better Auth session for the incoming request and attaches
@@ -11,9 +14,18 @@ import { auth } from "../lib/auth.js";
  */
 export const requireAuth = async (req: Request, res: Response, next: NextFunction) => {
     try {
+        // The global resolveSession middleware already resolved the Better Auth
+        // session for this request and attached req.user. Reuse it instead of
+        // making a second identical getSession() call (a DB round-trip) on every
+        // authenticated request. Fall back to a fresh lookup only when no session
+        // was resolved upstream.
+        if (req.user?.id) {
+            return next();
+        }
+
         const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
         if (!session?.user) {
-            return res.status(401).json({ error: "Unauthorized", message: "You must be signed in to do this." });
+            return unauthorized(res);
         }
 
         const role = (session.user as { role?: UserRoles }).role;
@@ -33,13 +45,14 @@ export const requireAuth = async (req: Request, res: Response, next: NextFunctio
 };
 
 /**
- * Restricts a route to the given roles. Must run after requireAuth.
+ * Action-level gate: restricts a route to the given roles. Must run after
+ * requireAuth. Pass a role group from the policy layer, e.g.
+ * `requireRole(...STAFF_ROLES)` or `requireRole(...ADMIN_ROLES)`.
  */
 export const requireRole = (...roles: Array<UserRoles>) => {
     return (req: Request, res: Response, next: NextFunction) => {
-        if (!req.user?.role || !roles.includes(req.user.role)) {
-            return res.status(403).json({ error: "Forbidden", message: "You don't have permission to do this." });
-        }
+        if (!req.user?.role) return unauthorized(res);
+        if (!roles.includes(req.user.role)) return forbidden(res);
         next();
     };
 };

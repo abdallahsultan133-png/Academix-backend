@@ -4,13 +4,13 @@ import { and, desc, eq, getTableColumns, inArray, isNull, or } from "drizzle-orm
 import { db } from "../db/index.js";
 import { announcements, classes, enrollments } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createAnnouncementSchema, updateAnnouncementSchema } from "../lib/schemas.js";
 import { notifyEnrolledStudents } from "./notifications.js";
 import { sendAnnouncementEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -75,7 +75,7 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 // POST /api/announcements — teacher/admin only. classId omitted/null => school-wide.
-router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createAnnouncementSchema), async (req, res) => {
+router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAnnouncementSchema), async (req, res) => {
     try {
         const { classId, title, content, pinned } = req.body as {
             classId?: number | null;
@@ -84,8 +84,8 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             pinned?: boolean;
         };
 
-        if (classId && req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only post announcements for classes you teach." });
+        if (classId && policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only post announcements for classes you teach.");
         }
 
         const [created] = await db
@@ -140,15 +140,15 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
 });
 
 // PUT /api/announcements/:id — the original author or an admin
-router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(updateAnnouncementSchema), async (req, res) => {
+router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(updateAnnouncementSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid announcement id" });
 
         const [existing] = await db.select().from(announcements).where(eq(announcements.id, id));
         if (!existing) return res.status(404).json({ error: "Announcement not found" });
-        if (existing.authorId !== req.user!.id && req.user!.role !== "admin" && req.user!.role !== "super_admin") {
-            return res.status(403).json({ error: "You can only edit your own announcements." });
+        if (!policy.ownsOrAdmin(req.user!, existing.authorId)) {
+            return policy.forbidden(res, "You can only edit your own announcements.");
         }
 
         const { title, content, pinned, classId } = req.body as {
@@ -179,15 +179,15 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
 });
 
 // DELETE /api/announcements/:id — the original author or an admin
-router.delete("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+router.delete("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid announcement id" });
 
         const [existing] = await db.select().from(announcements).where(eq(announcements.id, id));
         if (!existing) return res.status(404).json({ error: "Announcement not found" });
-        if (existing.authorId !== req.user!.id && req.user!.role !== "admin" && req.user!.role !== "super_admin") {
-            return res.status(403).json({ error: "You can only delete your own announcements." });
+        if (!policy.ownsOrAdmin(req.user!, existing.authorId)) {
+            return policy.forbidden(res, "You can only delete your own announcements.");
         }
 
         await db.delete(announcements).where(eq(announcements.id, id));

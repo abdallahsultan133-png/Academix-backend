@@ -61,7 +61,17 @@ vi.mock("../db/index.js", () => {
 });
 
 vi.mock("../lib/auth.js", () => ({
-    auth: { api: { getSession: vi.fn(async () => null) } },
+    auth: {
+        api: {
+            getSession: vi.fn(async () => null),
+            requestPasswordReset: vi.fn(async () => ({ status: true })),
+        },
+        // Awaited by POST /api/users/:id/reset-password in "temporary" mode.
+        $context: Promise.resolve({
+            password: { hash: vi.fn(async () => "hashed-password") },
+            internalAdapter: { deleteUserSessions: vi.fn(async () => undefined) },
+        }),
+    },
 }));
 
 /** Queue the value(s) the next DB query/queries should resolve to (FIFO). */
@@ -75,6 +85,7 @@ const { default: usersRouter } = await import("./users.js");
 const { default: classesRouter } = await import("./classes.js");
 const { default: gradesRouter } = await import("./grades.js");
 const { default: attendanceRouter } = await import("./attendance.js");
+const { default: calendarRouter } = await import("./calendar.js");
 
 // ── Test users ───────────────────────────────────────────────────────────────
 type TestUser = { id: string; name: string; email: string; role: UserRoles };
@@ -108,6 +119,7 @@ beforeAll(async () => {
     app.use("/api/classes", classesRouter);
     app.use("/api/grades", gradesRouter);
     app.use("/api/attendance", attendanceRouter);
+    app.use("/api/calendar", calendarRouter);
 
     server = await new Promise<Server>((resolve) => {
         const s = app.listen(0, () => resolve(s));
@@ -199,6 +211,102 @@ describe("PATCH /api/users/:id/role — privilege-escalation guard", () => {
     it("a super_admin CAN grant admin-level roles", async () => {
         const r = await call("PATCH", "/api/users/u9/role", { as: USERS.superAdmin, body: { role: "admin" } });
         expect(r.status).toBe(200);
+    });
+});
+
+describe("POST /api/users/:id/reset-password — admin password reset", () => {
+    const target = { id: "u9", name: "Nia Ninth", email: "nia@school.test", role: "student" };
+
+    it("401 without a session", async () => {
+        const r = await call("POST", "/api/users/u9/reset-password", { body: { mode: "email" } });
+        expect(r.status).toBe(401);
+    });
+
+    it("403 for non-admins (student, parent, teacher)", async () => {
+        for (const as of [USERS.student, USERS.parent, USERS.teacher]) {
+            const r = await call("POST", "/api/users/u9/reset-password", { as, body: { mode: "email" } });
+            expect(r.status).toBe(403);
+        }
+    });
+
+    it("400 for an unknown mode", async () => {
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "carrier-pigeon" } });
+        expect(r.status).toBe(400);
+    });
+
+    it("404 when the target user does not exist", async () => {
+        queueDb([]); // target lookup → no rows
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "email" } });
+        expect(r.status).toBe(404);
+    });
+
+    it("an admin CAN send a reset email to an ordinary user", async () => {
+        queueDb([target]);
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "email" } });
+        expect(r.status).toBe(200);
+        expect(r.body.data).toMatchObject({ mode: "email" });
+    });
+
+    it("an admin CAN set a temporary password, returned once", async () => {
+        queueDb([target], [{ id: "cred-1" }]); // target lookup, then existing credential account
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "temporary" } });
+        expect(r.status).toBe(200);
+        expect(r.body.data.mode).toBe("temporary");
+        expect(typeof r.body.data.temporaryPassword).toBe("string");
+        expect(r.body.data.temporaryPassword.length).toBeGreaterThanOrEqual(8);
+    });
+
+    it("a plain admin CANNOT reset an admin-level account", async () => {
+        queueDb([{ ...target, role: "super_admin" }]);
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "email" } });
+        expect(r.status).toBe(403);
+    });
+
+    it("a super_admin CAN reset an admin's password", async () => {
+        queueDb([{ ...target, role: "admin" }]);
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.superAdmin, body: { mode: "email" } });
+        expect(r.status).toBe(200);
+    });
+});
+
+describe("DELETE /api/users/:id — admin user deletion", () => {
+    const target = { id: "u9", name: "Nia Ninth", email: "nia@school.test", role: "student" };
+
+    it("401 without a session", async () => {
+        expect((await call("DELETE", "/api/users/u9")).status).toBe(401);
+    });
+
+    it("403 for non-admins (student, parent, teacher)", async () => {
+        for (const as of [USERS.student, USERS.parent, USERS.teacher]) {
+            expect((await call("DELETE", "/api/users/u9", { as })).status).toBe(403);
+        }
+    });
+
+    it("400 when an admin targets their own account", async () => {
+        const r = await call("DELETE", `/api/users/${USERS.admin.id}`, { as: USERS.admin });
+        expect(r.status).toBe(400);
+    });
+
+    it("404 when the target user does not exist", async () => {
+        queueDb([]); // target lookup → no rows
+        expect((await call("DELETE", "/api/users/u9", { as: USERS.admin })).status).toBe(404);
+    });
+
+    it("an admin CAN delete an ordinary user", async () => {
+        queueDb([target]);
+        const r = await call("DELETE", "/api/users/u9", { as: USERS.admin });
+        expect(r.status).toBe(200);
+        expect(r.body.data).toMatchObject({ id: "u9" });
+    });
+
+    it("a plain admin CANNOT delete an admin-level account", async () => {
+        queueDb([{ ...target, role: "super_admin" }]);
+        expect((await call("DELETE", "/api/users/u9", { as: USERS.admin })).status).toBe(403);
+    });
+
+    it("a super_admin CAN delete an admin", async () => {
+        queueDb([{ ...target, role: "admin" }]);
+        expect((await call("DELETE", "/api/users/u9", { as: USERS.superAdmin })).status).toBe(200);
     });
 });
 
@@ -372,5 +480,31 @@ describe("attendance — marking is staff + class-scoped", () => {
 
     it("an admin can mark attendance for any class", async () => {
         expect((await call("POST", "/api/attendance", { as: USERS.admin, body })).status).toBe(200);
+    });
+});
+
+describe("calendar events — add / remove is admin only", () => {
+    const newEvent = { title: "Staff meeting", startAt: "2026-09-01T10:00" };
+
+    it("only an admin or super_admin can add an event", async () => {
+        expect((await call("POST", "/api/calendar")).status).toBe(401);
+        expect((await call("POST", "/api/calendar", { as: USERS.student, body: newEvent })).status).toBe(403);
+        expect((await call("POST", "/api/calendar", { as: USERS.parent, body: newEvent })).status).toBe(403);
+        expect((await call("POST", "/api/calendar", { as: USERS.teacher, body: newEvent })).status).toBe(403);
+
+        expect((await call("POST", "/api/calendar", { as: USERS.admin, body: newEvent })).status).toBe(201);
+        expect((await call("POST", "/api/calendar", { as: USERS.superAdmin, body: newEvent })).status).toBe(201);
+    });
+
+    it("only an admin or super_admin can remove an event", async () => {
+        expect((await call("DELETE", "/api/calendar/1", { as: USERS.teacher })).status).toBe(403);
+        expect((await call("DELETE", "/api/calendar/1", { as: USERS.student })).status).toBe(403);
+        // delete().returning() yields a row from the mock → handler reaches 200.
+        expect((await call("DELETE", "/api/calendar/1", { as: USERS.admin })).status).toBe(200);
+    });
+
+    it("only an admin or super_admin can edit an event", async () => {
+        expect((await call("PUT", "/api/calendar/1", { as: USERS.teacher, body: { title: "Renamed" } })).status).toBe(403);
+        expect((await call("PUT", "/api/calendar/1", { as: USERS.admin, body: { title: "Renamed" } })).status).toBe(200);
     });
 });
