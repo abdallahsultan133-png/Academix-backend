@@ -231,6 +231,30 @@ export async function sendWelcomeEmail(params: {
     });
 }
 
+export async function sendPasswordResetEmail(params: {
+    to: string;
+    name?: string;
+    /** Ready-to-use reset link from Better Auth — points at the reset endpoint,
+     *  which then bounces the browser to the frontend /reset-password page. */
+    resetUrl: string;
+}): Promise<void> {
+    await sendEmail({
+        to: params.to,
+        subject: "Reset your ClassroomMS password",
+        html: wrap(`
+            <h2 style="margin:0 0 8px;font-size:18px;">Reset your password</h2>
+            <p style="color:#475569;margin:0 0 16px;">
+                ${params.name ? `Hi ${escapeHtml(params.name)}, we` : "We"} received a request to reset the
+                password for this account. Choose a new one using the button below — the link expires in 1 hour.
+            </p>
+            <a href="${params.resetUrl}" style="${buttonStyle}">Choose a new password</a>
+            <p style="color:#94a3b8;font-size:12px;margin:16px 0 0;">
+                Didn't ask for this? You can safely ignore this email — your password won't change.
+            </p>
+        `),
+    });
+}
+
 export async function sendExamReminderEmail(params: {
     to: string[];
     examTitle: string;

@@ -3,11 +3,11 @@ import { eq, or } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { studentProfiles, classGrades, attendance, classes, enrollments } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
-import { updateProfileSchema, linkParentSchema } from "../lib/schemas.js";
+import { updateProfileSchema, updateAvatarSchema, linkParentSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessStudent } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -62,12 +62,42 @@ router.put("/me", requireAuth, validateBody(updateProfileSchema), async (req, re
     }
 });
 
+// PUT /api/profile/me/photo — set or clear the caller's own display photo.
+// Body: { url, publicId } to set (url must be a Cloudinary image), or
+// { url: null } to remove it and fall back to initials. Anyone can change
+// their own; no role check needed.
+router.put("/me/photo", requireAuth, validateBody(updateAvatarSchema), async (req, res) => {
+    try {
+        const userId = req.user!.id!;
+        const { url, publicId } = req.body as { url: string | null; publicId?: string | null };
+
+        const [updated] = await db
+            .update(user)
+            .set({ image: url, imageCldPubId: url ? (publicId ?? null) : null })
+            .where(eq(user.id, userId))
+            .returning({
+                id: user.id, name: user.name, email: user.email, role: user.role, image: user.image,
+            });
+
+        await logAction({
+            req,
+            action: url ? "user.photo_update" : "user.photo_remove",
+            resource: "users",
+            resourceId: userId,
+        });
+
+        res.json({ data: updated });
+    } catch (e) {
+        console.error("PUT /profile/me/photo error:", e);
+        res.status(500).json({ error: "Failed to update photo" });
+    }
+});
+
 router.get("/student/:studentId", requireAuth, async (req, res) => {
     try {
         const studentId = String(req.params.studentId ?? "");
-        const authorized = await canAccessStudent({ id: req.user!.id!, role: req.user!.role, email: req.user!.email }, studentId);
-        if (!authorized) {
-            return res.status(403).json({ error: "Forbidden" });
+        if (!(await policy.canAccessStudent(req.user!, studentId))) {
+            return policy.forbidden(res);
         }
         const [studentUser] = await db.select({
             id: user.id, name: user.name, email: user.email, role: user.role, image: user.image,
@@ -107,7 +137,7 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
 // PATCH /api/profile/student/:studentId/link-parent — admin/super_admin only.
 // Body: { email: string } to link (the user must already have role "parent"),
 // or { email: null } to unlink.
-router.patch("/student/:studentId/link-parent", requireAuth, requireRole("admin", "super_admin"), validateBody(linkParentSchema), async (req, res) => {
+router.patch("/student/:studentId/link-parent", requireAuth, requireRole(...ADMIN_ROLES), validateBody(linkParentSchema), async (req, res) => {
     try {
         const studentId = String(req.params.studentId ?? "");
         const { email } = req.body as { email: string | null };

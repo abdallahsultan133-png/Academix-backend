@@ -3,13 +3,13 @@ import { desc, eq } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { auditLogs } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import type { Request } from "express";
 
 const router = express.Router();
 
 // GET /api/audit-logs?limit=50 — admin/super_admin only
-router.get("/", requireAuth, requireRole("admin", "super_admin"), async (req, res) => {
+router.get("/", requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
     try {
         const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 200);
 

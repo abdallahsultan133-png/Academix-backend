@@ -4,11 +4,12 @@ import { and, avg, desc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { assignments, classGrades, classes, enrollments, examResults, exams, submissions } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createExamSchema, examResultsSchema, gradebookSaveSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass, canAccessStudent, getLinkedChildIds } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
+import { getLinkedChildIds } from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -35,7 +36,8 @@ router.get("/exams", requireAuth, async (req, res) => {
         const conditions = classId ? [eq(exams.classId, classId)] : [];
         // A teacher only sees exams for classes they teach — not every
         // teacher's. Admins, parents, and super_admins see everything.
-        if (req.user!.role === "teacher") conditions.push(eq(classes.teacherId, req.user!.id!));
+        const teacherScope = policy.teacherClassScope(req.user!);
+        if (teacherScope) conditions.push(teacherScope);
 
         const list = await db
             .select({
@@ -57,15 +59,15 @@ router.get("/exams", requireAuth, async (req, res) => {
 });
 
 // POST /api/grades/exams — teacher/admin
-router.post("/exams", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createExamSchema), async (req, res) => {
+router.post("/exams", requireAuth, requireRole(...STAFF_ROLES), validateBody(createExamSchema), async (req, res) => {
     try {
         const { classId, title, description, scheduledAt, durationMinutes, maxScore, venue } = req.body as {
             classId: number; title: string; description?: string | null;
             scheduledAt?: string | null; durationMinutes?: number | null; maxScore?: number; venue?: string | null;
         };
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only create exams for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only create exams for classes you teach.");
         }
 
         const [created] = await db.insert(exams).values({
@@ -89,14 +91,14 @@ router.post("/exams", requireAuth, requireRole("teacher", "admin", "super_admin"
 });
 
 // DELETE /api/grades/exams/:id — teacher/admin
-router.delete("/exams/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+router.delete("/exams/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
 
         const [existing] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, id));
         if (!existing) return res.status(404).json({ error: "Exam not found" });
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
-            return res.status(403).json({ error: "You can only delete exams for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only delete exams for classes you teach.");
         }
 
         const [deleted] = await db.delete(exams).where(eq(exams.id, id)).returning({ id: exams.id });
@@ -116,11 +118,11 @@ router.get("/exams/:examId/results", requireAuth, async (req, res) => {
     try {
         const examId = Number(req.params.examId);
 
-        if (req.user!.role === "teacher") {
+        if (policy.isTeacher(req.user!)) {
             const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
             if (!exam) return res.status(404).json({ error: "Exam not found" });
-            if (!(await canAccessClass(req.user!, exam.classId))) {
-                return res.status(403).json({ error: "You can only view results for classes you teach." });
+            if (!(await policy.canManageClass(req.user!, exam.classId))) {
+                return policy.forbidden(res, "You can only view results for classes you teach.");
             }
         }
 
@@ -132,8 +134,8 @@ router.get("/exams/:examId/results", requireAuth, async (req, res) => {
             .from(examResults)
             .innerJoin(user, eq(examResults.studentId, user.id))
             .where(
-                req.user?.role === "student"
-                    ? and(eq(examResults.examId, examId), eq(examResults.studentId, req.user.id!))
+                policy.isStudent(req.user!)
+                    ? and(eq(examResults.examId, examId), eq(examResults.studentId, req.user!.id!))
                     : eq(examResults.examId, examId)
             )
             .orderBy(user.name);
@@ -146,16 +148,16 @@ router.get("/exams/:examId/results", requireAuth, async (req, res) => {
 });
 
 // POST /api/grades/exams/:examId/results — bulk upsert results (teacher/admin)
-router.post("/exams/:examId/results", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(examResultsSchema), async (req, res) => {
+router.post("/exams/:examId/results", requireAuth, requireRole(...STAFF_ROLES), validateBody(examResultsSchema), async (req, res) => {
     try {
         const examId = Number(req.params.examId);
         const { records } = req.body as { records: Array<{ studentId: string; score: number; remarks?: string | null }> };
 
-        if (req.user!.role === "teacher") {
+        if (policy.isTeacher(req.user!)) {
             const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
             if (!exam) return res.status(404).json({ error: "Exam not found" });
-            if (!(await canAccessClass(req.user!, exam.classId))) {
-                return res.status(403).json({ error: "You can only grade exams for classes you teach." });
+            if (!(await policy.canManageClass(req.user!, exam.classId))) {
+                return policy.forbidden(res, "You can only grade exams for classes you teach.");
             }
         }
 
@@ -192,28 +194,20 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid classId" });
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only view the gradebook for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only view the gradebook for classes you teach.");
         }
 
-        if (req.user!.role === "student") {
-            const [enrolled] = await db
-                .select({ studentId: enrollments.studentId })
-                .from(enrollments)
-                .where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!)));
-            if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
+        if (policy.isStudent(req.user!) && !(await policy.isEnrolledInClass(req.user!.id!, classId))) {
+            return policy.forbidden(res, "You're not enrolled in this class.");
         }
 
         let childIds: string[] = [];
-        if (req.user!.role === "parent") {
+        if (policy.isParent(req.user!)) {
             childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
-            const [childEnrolled] = childIds.length > 0
-                ? await db
-                    .select({ studentId: enrollments.studentId })
-                    .from(enrollments)
-                    .where(and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds)))
-                : [];
-            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+            if (!(await policy.anyChildEnrolledInClass(childIds, classId))) {
+                return policy.forbidden(res, "None of your children are enrolled in this class.");
+            }
         }
 
         const [roster, assignmentAvgs, examAvgs, savedGrades] = await Promise.all([
@@ -291,9 +285,9 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
 
         // A student only sees their own row; a parent only their linked
         // children's rows — never the rest of the class's grades.
-        const visible = req.user!.role === "student"
+        const visible = policy.isStudent(req.user!)
             ? gradebook.filter((row) => row.studentId === req.user!.id)
-            : req.user!.role === "parent"
+            : policy.isParent(req.user!)
                 ? gradebook.filter((row) => childIds.includes(row.studentId))
                 : gradebook;
 
@@ -305,15 +299,15 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
 });
 
 // POST /api/grades/gradebook/:classId/save — teacher/admin saves/overrides final grades
-router.post("/gradebook/:classId/save", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(gradebookSaveSchema), async (req, res) => {
+router.post("/gradebook/:classId/save", requireAuth, requireRole(...STAFF_ROLES), validateBody(gradebookSaveSchema), async (req, res) => {
     try {
         const classId = Number(req.params.classId);
         const { records } = req.body as {
             records: Array<{ studentId: string; finalGrade: number; remarks?: string | null }>
         };
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only save grades for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only save grades for classes you teach.");
         }
 
         const gradedBy = req.user!.id!;
@@ -357,9 +351,8 @@ router.post("/gradebook/:classId/save", requireAuth, requireRole("teacher", "adm
 router.get("/student/:studentId", requireAuth, async (req, res) => {
     try {
         const studentId = String(req.params.studentId ?? "");
-        const authorized = await canAccessStudent({ id: req.user!.id!, role: req.user!.role, email: req.user!.email }, studentId);
-        if (!authorized) {
-            return res.status(403).json({ error: "Forbidden" });
+        if (!(await policy.canAccessStudent(req.user!, studentId))) {
+            return policy.forbidden(res);
         }
 
         const grades = await db

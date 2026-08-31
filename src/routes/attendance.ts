@@ -4,11 +4,12 @@ import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { attendance, classes, enrollments, qrSessions } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { markAttendanceSchema, qrGenerateSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass, canAccessStudent, getLinkedChildIds } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
+import { getLinkedChildIds } from "../lib/policy.js";
 import crypto from "crypto";
 
 const router = express.Router();
@@ -26,8 +27,8 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
         if (!DATE_RE.test(date)) return res.status(400).json({ error: "date query param must be YYYY-MM-DD" });
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only view rosters for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only view rosters for classes you teach.");
         }
 
         const roster = await db
@@ -63,7 +64,7 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
 // POST /api/attendance
 // Body: { classId: number, date: "YYYY-MM-DD", records: [{ studentId, status, notes? }] }
 // Upserts one attendance row per student for that class/date. Teachers/admins only.
-router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(markAttendanceSchema), async (req, res) => {
+router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(markAttendanceSchema), async (req, res) => {
     try {
         const { classId, date, records } = req.body as {
             classId: number;
@@ -71,8 +72,8 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             records: Array<{ studentId: string; status: "present" | "absent" | "late" | "excused"; notes?: string | null }>;
         };
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only mark attendance for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only mark attendance for classes you teach.");
         }
 
         const markedBy = req.user!.id!;
@@ -116,28 +117,20 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only view reports for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only view reports for classes you teach.");
         }
 
-        if (req.user!.role === "student") {
-            const [enrolled] = await db
-                .select({ studentId: enrollments.studentId })
-                .from(enrollments)
-                .where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!)));
-            if (!enrolled) return res.status(403).json({ error: "You're not enrolled in this class." });
+        if (policy.isStudent(req.user!) && !(await policy.isEnrolledInClass(req.user!.id!, classId))) {
+            return policy.forbidden(res, "You're not enrolled in this class.");
         }
 
         let childIds: string[] = [];
-        if (req.user!.role === "parent") {
+        if (policy.isParent(req.user!)) {
             childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
-            const [childEnrolled] = childIds.length > 0
-                ? await db
-                    .select({ studentId: enrollments.studentId })
-                    .from(enrollments)
-                    .where(and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds)))
-                : [];
-            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+            if (!(await policy.anyChildEnrolledInClass(childIds, classId))) {
+                return policy.forbidden(res, "None of your children are enrolled in this class.");
+            }
         }
 
         const { from, to } = req.query as { from?: string; to?: string };
@@ -146,8 +139,8 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
         if (to && DATE_RE.test(to)) conditions.push(lte(attendance.date, to));
 
         const rosterScope =
-            req.user!.role === "student" ? and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!))
-            : req.user!.role === "parent" ? and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds))
+            policy.isStudent(req.user!) ? and(eq(enrollments.classId, classId), eq(enrollments.studentId, req.user!.id!))
+            : policy.isParent(req.user!) ? and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds))
             : eq(enrollments.classId, classId);
 
         const rows = await db
@@ -187,8 +180,7 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
         const studentId = String(req.params.studentId ?? "");
         if (!studentId) return res.status(400).json({ error: "studentId is required" });
 
-        const authorized = await canAccessStudent({ id: req.user!.id!, role: req.user!.role, email: req.user!.email }, studentId);
-        if (!authorized) return res.status(403).json({ error: "Forbidden" });
+        if (!(await policy.canAccessStudent(req.user!, studentId))) return policy.forbidden(res);
 
         const classId = req.query.classId ? Number(req.query.classId) : undefined;
         const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? "30"), 10) || 30), 200);
@@ -220,14 +212,14 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
 
 // POST /api/attendance/qr/generate — teacher/admin: generate a QR token for a class session
 // Token is valid for 15 minutes by default.
-router.post("/qr/generate", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(qrGenerateSchema), async (req, res) => {
+router.post("/qr/generate", requireAuth, requireRole(...STAFF_ROLES), validateBody(qrGenerateSchema), async (req, res) => {
     try {
         const { classId, date, expiryMinutes = 15 } = req.body as {
             classId: number; date: string; expiryMinutes?: number;
         };
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only generate QR sessions for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only generate QR sessions for classes you teach.");
         }
 
         const token = crypto.randomBytes(24).toString("hex");
@@ -259,9 +251,9 @@ router.post("/qr/:token", requireAuth, async (req, res) => {
         if (new Date() > new Date(session.expiresAt)) return res.status(410).json({ error: "This QR code has expired." });
 
         // Check student is enrolled
-        const [enrolled] = await db.select().from(enrollments)
-            .where(and(eq(enrollments.classId, session!.classId), eq(enrollments.studentId, studentId)));
-        if (!enrolled) return res.status(403).json({ error: "You are not enrolled in this class." });
+        if (!(await policy.isEnrolledInClass(studentId, session!.classId))) {
+            return policy.forbidden(res, "You are not enrolled in this class.");
+        }
 
         // Upsert attendance as present
         const [result] = await db.insert(attendance).values({

@@ -2,38 +2,42 @@ import type {Request, Response, NextFunction} from "express";
 import {ArcjetNodeRequest, slidingWindow} from "@arcjet/node";
 import aj, {ARCJET_MODE} from '../config/arcjet.js';
 
+// Build the per-limit Arcjet clients once at module load instead of
+// reconstructing the rule chain on every single request (this middleware runs
+// globally, so that was pure per-request allocation on a hot path).
+const rateLimitedClient = (max: number) =>
+    aj.withRule(slidingWindow({ mode: ARCJET_MODE, interval: '60s', max }));
+
+const CLIENTS = {
+    admin: rateLimitedClient(100),
+    user: rateLimitedClient(60),
+    guest: rateLimitedClient(30),
+} as const;
+
 const securityMiddleware = async (req: Request, res: Response, next: NextFunction) => {
     if(process.env.NODE_ENV === 'test') return next();
 
     try {
         const role: RateLimitRole = req.user?.role ?? 'guest';
 
-        let limit: number;
+        let client: (typeof CLIENTS)[keyof typeof CLIENTS];
         let message: string;
 
         switch (role) {
             case 'admin':
-                limit=100;
+                client = CLIENTS.admin;
                 message ='Admin request limit exceeded (100 per minute). Slow down.';
                 break;
             case 'teacher':
             case 'student':
-                limit=60;
+                client = CLIENTS.user;
                 message ='User request limit exceeded (60 per minute). Please wait.';
                 break;
             default:
-                limit=30
+                client = CLIENTS.guest;
                 message ='Guest request limit exceeded (30 per minute). Please sign up for higher limits.'
                 break;
         }
-
-        const client = aj.withRule(
-            slidingWindow({
-                mode: ARCJET_MODE,
-                interval: '60s',
-                max: limit,
-            })
-        )
 
         const arcjetRequest: ArcjetNodeRequest = {
             headers: req.headers,

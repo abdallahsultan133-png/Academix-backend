@@ -7,7 +7,7 @@ import { requireAuth } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createFileSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessStudent } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
@@ -17,9 +17,8 @@ const router = express.Router();
 router.get("/student/:studentId", requireAuth, async (req, res) => {
     try {
         const studentId = String(req.params.studentId ?? "");
-        const authorized = await canAccessStudent({ id: req.user!.id!, role: req.user!.role, email: req.user!.email }, studentId);
-        if (!authorized) {
-            return res.status(403).json({ error: "Forbidden" });
+        if (!(await policy.canAccessStudent(req.user!, studentId))) {
+            return policy.forbidden(res);
         }
 
         const rows = await db
@@ -55,9 +54,8 @@ router.post("/", requireAuth, validateBody(createFileSchema), async (req, res) =
             url: string; cldPubId: string; fileSize?: number | null;
         };
 
-        const authorized = await canAccessStudent({ id: req.user!.id!, role: req.user!.role, email: req.user!.email }, studentId);
-        if (!authorized) {
-            return res.status(403).json({ error: "You don't have permission to upload documents for this student." });
+        if (!(await policy.canAccessStudent(req.user!, studentId))) {
+            return policy.forbidden(res, "You don't have permission to upload documents for this student.");
         }
 
         const [created] = await db.insert(files).values({
@@ -70,7 +68,8 @@ router.post("/", requireAuth, validateBody(createFileSchema), async (req, res) =
             fileSize: fileSize ?? null,
         }).returning();
 
-        await logAction({ req, action: "file.upload", resource: "files", resourceId: created?.id, details: `Uploaded "${name.trim()}" for student ${studentId}` });
+        const [fileStudent] = await db.select({ name: user.name }).from(user).where(eq(user.id, studentId));
+        await logAction({ req, action: "file.upload", resource: "files", resourceId: created?.id, details: `Uploaded "${name.trim()}" for ${fileStudent?.name ?? studentId}` });
 
         res.status(201).json({ data: created });
     } catch (e) {
@@ -89,9 +88,8 @@ router.delete("/:id", requireAuth, async (req, res) => {
         if (!existing) return res.status(404).json({ error: "Document not found" });
 
         const isOwnerOrUploader = req.user!.id === existing.studentId || req.user!.id === existing.uploadedBy;
-        const isStaff = req.user!.role === "teacher" || req.user!.role === "admin" || req.user!.role === "super_admin";
-        if (!isOwnerOrUploader && !isStaff) {
-            return res.status(403).json({ error: "You don't have permission to delete this document." });
+        if (!isOwnerOrUploader && !policy.isStaff(req.user!)) {
+            return policy.forbidden(res, "You don't have permission to delete this document.");
         }
 
         await db.delete(files).where(eq(files.id, id));

@@ -15,7 +15,7 @@ import {
     files,
 } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { aiChatSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
@@ -178,7 +178,7 @@ Guidelines:
 router.post(
     "/chat",
     requireAuth,
-    requireRole("teacher", "admin", "super_admin"),
+    requireRole(...STAFF_ROLES),
     validateBody(aiChatSchema),
     async (req, res) => {
         try {

@@ -4,13 +4,14 @@ import { and, desc, eq, getTableColumns, gte, inArray, lte, sql } from "drizzle-
 import { db } from "../db/index.js";
 import { assignments, classes, enrollments, submissions } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createAssignmentSchema, updateAssignmentSchema, submitAssignmentSchema, gradeSubmissionSchema } from "../lib/schemas.js";
 import { notifyEnrolledStudents, notifyStudent } from "./notifications.js";
 import { sendAssignmentEmail, sendGradeEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
-import { canAccessClass, getLinkedChildIds } from "../lib/access-control.js";
+import * as policy from "../lib/policy.js";
+import { getLinkedChildIds } from "../lib/policy.js";
 import { runAiDetection } from "../lib/ai-detector.js";
 
 const router = express.Router();
@@ -27,13 +28,14 @@ router.get("/", requireAuth, async (req, res) => {
 
         const conditions = [];
         if (classId) conditions.push(eq(assignments.classId, Number(classId)));
-        // A teacher only sees assignments for classes they teach — not every
-        // teacher's. Admins and super_admins see everything.
-        if (req.user!.role === "teacher") conditions.push(eq(classes.teacherId, req.user!.id!));
+        // Row-level list scoping (policy): a teacher only sees assignments for
+        // classes they teach; admins/super_admins see everything.
+        const teacherScope = policy.teacherClassScope(req.user!);
+        if (teacherScope) conditions.push(teacherScope);
 
         // A parent only sees assignments for classes their own linked
         // children are enrolled in — not every class in the school.
-        if (req.user!.role === "parent") {
+        if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
             const childClassIds = childIds.length > 0
                 ? [...new Set((await db
@@ -43,6 +45,18 @@ router.get("/", requireAuth, async (req, res) => {
                 ).map((r) => r.classId))]
                 : [];
             conditions.push(childClassIds.length > 0 ? inArray(assignments.classId, childClassIds) : sql`false`);
+        }
+
+        // A student only sees assignments for classes they're actually enrolled
+        // in — not every class in the school. Without this, GET /api/assignments
+        // (or ?classId= for a class they're not in) leaks other classes' work.
+        if (policy.isStudent(req.user!)) {
+            const enrolledClassIds = (await db
+                .select({ classId: enrollments.classId })
+                .from(enrollments)
+                .where(eq(enrollments.studentId, req.user!.id!))
+            ).map((r) => r.classId);
+            conditions.push(enrolledClassIds.length > 0 ? inArray(assignments.classId, enrolledClassIds) : sql`false`);
         }
 
         const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -61,7 +75,47 @@ router.get("/", requireAuth, async (req, res) => {
             .limit(limitPerPage)
             .offset(offset);
 
-        res.status(200).json({ data: list });
+        // Enrich each row with submission progress so the list can show honest
+        // workflow states (needs-grading / graded for staff; to-do / submitted /
+        // graded for a student) without the client fetching each assignment.
+        const assignmentIds = list.map((a) => a.id);
+        const [aggRows, myRows] = await Promise.all([
+            assignmentIds.length > 0
+                ? db
+                    .select({
+                        assignmentId: submissions.assignmentId,
+                        total: sql<number>`count(*)`.mapWith(Number),
+                        graded: sql<number>`count(*) filter (where ${submissions.status} = 'graded')`.mapWith(Number),
+                    })
+                    .from(submissions)
+                    .where(inArray(submissions.assignmentId, assignmentIds))
+                    .groupBy(submissions.assignmentId)
+                : Promise.resolve([]),
+            assignmentIds.length > 0 && policy.isStudent(req.user!)
+                ? db
+                    .select({
+                        assignmentId: submissions.assignmentId,
+                        status: submissions.status,
+                        score: submissions.score,
+                    })
+                    .from(submissions)
+                    .where(and(eq(submissions.studentId, req.user!.id!), inArray(submissions.assignmentId, assignmentIds)))
+                : Promise.resolve([]),
+        ]);
+
+        const aggById = new Map(aggRows.map((r) => [r.assignmentId, r]));
+        const mineById = new Map(myRows.map((r) => [r.assignmentId, r]));
+
+        const data = list.map((a) => ({
+            ...a,
+            submissionCount: aggById.get(a.id)?.total ?? 0,
+            gradedCount: aggById.get(a.id)?.graded ?? 0,
+            mySubmission: mineById.get(a.id)
+                ? { status: mineById.get(a.id)!.status, score: mineById.get(a.id)!.score }
+                : null,
+        }));
+
+        res.status(200).json({ data });
     } catch (e) {
         console.error("GET /assignments error:", e);
         res.status(500).json({ error: "Failed to load assignments" });
@@ -88,15 +142,11 @@ router.get("/:id", requireAuth, async (req, res) => {
 
         if (!assignment) return res.status(404).json({ error: "Assignment not found" });
 
-        if (req.user!.role === "parent") {
+        if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
-            const [childEnrolled] = childIds.length > 0
-                ? await db
-                    .select({ studentId: enrollments.studentId })
-                    .from(enrollments)
-                    .where(and(eq(enrollments.classId, assignment.classId), inArray(enrollments.studentId, childIds)))
-                : [];
-            if (!childEnrolled) return res.status(403).json({ error: "None of your children are enrolled in this class." });
+            if (!(await policy.anyChildEnrolledInClass(childIds, assignment.classId))) {
+                return policy.forbidden(res, "None of your children are enrolled in this class.");
+            }
         }
 
         let mySubmission = null;
@@ -116,7 +166,7 @@ router.get("/:id", requireAuth, async (req, res) => {
 });
 
 // POST /api/assignments — teacher/admin only
-router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createAssignmentSchema), async (req, res) => {
+router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAssignmentSchema), async (req, res) => {
     try {
         const { classId, title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
             classId: number;
@@ -129,8 +179,8 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
             attachmentName?: string | null;
         };
 
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, classId))) {
-            return res.status(403).json({ error: "You can only create assignments for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only create assignments for classes you teach.");
         }
 
         const [created] = await db
@@ -185,15 +235,15 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
 });
 
 // PUT /api/assignments/:id — teacher/admin only
-router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(updateAssignmentSchema), async (req, res) => {
+router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(updateAssignmentSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
         if (!existing) return res.status(404).json({ error: "Assignment not found" });
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
-            return res.status(403).json({ error: "You can only edit assignments for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only edit assignments for classes you teach.");
         }
 
         const { title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
@@ -232,15 +282,15 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
 });
 
 // DELETE /api/assignments/:id — teacher/admin only
-router.delete("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+router.delete("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
         if (!existing) return res.status(404).json({ error: "Assignment not found" });
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, existing.classId))) {
-            return res.status(403).json({ error: "You can only delete assignments for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only delete assignments for classes you teach.");
         }
 
         const [deleted] = await db.delete(assignments).where(eq(assignments.id, id)).returning({ id: assignments.id });
@@ -271,11 +321,9 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
         const [assignment] = await db.select().from(assignments).where(eq(assignments.id, assignmentId));
         if (!assignment) return res.status(404).json({ error: "Assignment not found" });
 
-        const [enrollment] = await db
-            .select()
-            .from(enrollments)
-            .where(and(eq(enrollments.classId, assignment.classId), eq(enrollments.studentId, req.user!.id!)));
-        if (!enrollment) return res.status(403).json({ error: "You are not enrolled in this class." });
+        if (!(await policy.isEnrolledInClass(req.user!.id!, assignment.classId))) {
+            return policy.forbidden(res, "You are not enrolled in this class.");
+        }
 
         // Once the deadline passes, submission is closed entirely — no more
         // late submissions accepted.
@@ -321,15 +369,15 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
 });
 
 // GET /api/assignments/:id/submissions — teacher/admin only. All submissions for grading.
-router.get("/:id/submissions", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const assignmentId = Number(req.params.id);
         if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid assignment id" });
 
         const [assignment] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, assignmentId));
         if (!assignment) return res.status(404).json({ error: "Assignment not found" });
-        if (req.user!.role === "teacher" && !(await canAccessClass(req.user!, assignment.classId))) {
-            return res.status(403).json({ error: "You can only view submissions for classes you teach." });
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, assignment.classId))) {
+            return policy.forbidden(res, "You can only view submissions for classes you teach.");
         }
 
         const rows = await db
@@ -350,20 +398,20 @@ router.get("/:id/submissions", requireAuth, requireRole("teacher", "admin", "sup
 });
 
 // PUT /api/assignments/submissions/:submissionId/grade — teacher/admin only
-router.put("/submissions/:submissionId/grade", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(gradeSubmissionSchema), async (req, res) => {
+router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF_ROLES), validateBody(gradeSubmissionSchema), async (req, res) => {
     try {
         const submissionId = Number(req.params.submissionId);
         if (!Number.isFinite(submissionId)) return res.status(400).json({ error: "Invalid submission id" });
 
-        if (req.user!.role === "teacher") {
+        if (policy.isTeacher(req.user!)) {
             const [existingSubmission] = await db
                 .select({ classId: assignments.classId })
                 .from(submissions)
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                 .where(eq(submissions.id, submissionId));
             if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
-            if (!(await canAccessClass(req.user!, existingSubmission.classId))) {
-                return res.status(403).json({ error: "You can only grade submissions for classes you teach." });
+            if (!(await policy.canManageClass(req.user!, existingSubmission.classId))) {
+                return policy.forbidden(res, "You can only grade submissions for classes you teach.");
             }
         }
 

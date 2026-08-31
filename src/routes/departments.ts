@@ -3,7 +3,7 @@ import { count, eq } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { departments } from "../db/schema/app.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createDepartmentSchema, updateDepartmentSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
@@ -22,7 +22,7 @@ router.get("/", requireAuth, async (_req, res) => {
 });
 
 // POST /api/departments — admin only
-router.post("/", requireAuth, requireRole("admin", "super_admin"), validateBody(createDepartmentSchema), async (req, res) => {
+router.post("/", requireAuth, requireRole(...ADMIN_ROLES), validateBody(createDepartmentSchema), async (req, res) => {
     try {
         const { name, code, description } = req.body as { name: string; code: string; description?: string | null };
         const [created] = await db
@@ -38,7 +38,7 @@ router.post("/", requireAuth, requireRole("admin", "super_admin"), validateBody(
 });
 
 // PUT /api/departments/:id — admin only
-router.put("/:id", requireAuth, requireRole("admin", "super_admin"), validateBody(updateDepartmentSchema), async (req, res) => {
+router.put("/:id", requireAuth, requireRole(...ADMIN_ROLES), validateBody(updateDepartmentSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid department id" });
@@ -66,7 +66,7 @@ router.put("/:id", requireAuth, requireRole("admin", "super_admin"), validateBod
 
 // DELETE /api/departments/:id — admin only (subjects reference departments with onDelete: restrict,
 // so this will fail with a FK error if the department still has subjects — that's intentional).
-router.delete("/:id", requireAuth, requireRole("admin", "super_admin"), async (req, res) => {
+router.delete("/:id", requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid department id" });

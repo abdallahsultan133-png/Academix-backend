@@ -3,7 +3,7 @@ import { and, eq, gte, lte, getTableColumns, desc, or, ne, isNull } from "drizzl
 import { db } from "../db/index.js";
 import { calendarEvents, classes, assignments, exams } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createCalendarEventSchema, updateCalendarEventSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
@@ -177,8 +177,8 @@ router.get("/", requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/calendar — teacher/admin
-router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(createCalendarEventSchema), async (req, res) => {
+// POST /api/calendar — admin only
+router.post("/", requireAuth, requireRole(...ADMIN_ROLES), validateBody(createCalendarEventSchema), async (req, res) => {
     try {
         const { title, description, type, startAt, endAt, allDay, classId, recurrenceFreq, recurrenceInterval, recurrenceEndAt } = req.body as {
             title: string; description?: string | null; type?: string;
@@ -210,8 +210,8 @@ router.post("/", requireAuth, requireRole("teacher", "admin", "super_admin"), va
     }
 });
 
-// PUT /api/calendar/:id — teacher/admin, only manual events
-router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), validateBody(updateCalendarEventSchema), async (req, res) => {
+// PUT /api/calendar/:id — admin only, manual events
+router.put("/:id", requireAuth, requireRole(...ADMIN_ROLES), validateBody(updateCalendarEventSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
         if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Invalid event id" });
@@ -245,8 +245,8 @@ router.put("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), 
     }
 });
 
-// DELETE /api/calendar/:id — teacher/admin
-router.delete("/:id", requireAuth, requireRole("teacher", "admin", "super_admin"), async (req, res) => {
+// DELETE /api/calendar/:id — admin only
+router.delete("/:id", requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
         const [deleted] = await db.delete(calendarEvents).where(eq(calendarEvents.id, id)).returning({ id: calendarEvents.id });
