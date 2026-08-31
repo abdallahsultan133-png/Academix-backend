@@ -68,7 +68,8 @@ router.post("/", requireAuth, validateBody(createFileSchema), async (req, res) =
             fileSize: fileSize ?? null,
         }).returning();
 
-        await logAction({ req, action: "file.upload", resource: "files", resourceId: created?.id, details: `Uploaded "${name.trim()}" for student ${studentId}` });
+        const [fileStudent] = await db.select({ name: user.name }).from(user).where(eq(user.id, studentId));
+        await logAction({ req, action: "file.upload", resource: "files", resourceId: created?.id, details: `Uploaded "${name.trim()}" for ${fileStudent?.name ?? studentId}` });
 
         res.status(201).json({ data: created });
     } catch (e) {

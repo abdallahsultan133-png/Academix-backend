@@ -75,7 +75,47 @@ router.get("/", requireAuth, async (req, res) => {
             .limit(limitPerPage)
             .offset(offset);
 
-        res.status(200).json({ data: list });
+        // Enrich each row with submission progress so the list can show honest
+        // workflow states (needs-grading / graded for staff; to-do / submitted /
+        // graded for a student) without the client fetching each assignment.
+        const assignmentIds = list.map((a) => a.id);
+        const [aggRows, myRows] = await Promise.all([
+            assignmentIds.length > 0
+                ? db
+                    .select({
+                        assignmentId: submissions.assignmentId,
+                        total: sql<number>`count(*)`.mapWith(Number),
+                        graded: sql<number>`count(*) filter (where ${submissions.status} = 'graded')`.mapWith(Number),
+                    })
+                    .from(submissions)
+                    .where(inArray(submissions.assignmentId, assignmentIds))
+                    .groupBy(submissions.assignmentId)
+                : Promise.resolve([]),
+            assignmentIds.length > 0 && policy.isStudent(req.user!)
+                ? db
+                    .select({
+                        assignmentId: submissions.assignmentId,
+                        status: submissions.status,
+                        score: submissions.score,
+                    })
+                    .from(submissions)
+                    .where(and(eq(submissions.studentId, req.user!.id!), inArray(submissions.assignmentId, assignmentIds)))
+                : Promise.resolve([]),
+        ]);
+
+        const aggById = new Map(aggRows.map((r) => [r.assignmentId, r]));
+        const mineById = new Map(myRows.map((r) => [r.assignmentId, r]));
+
+        const data = list.map((a) => ({
+            ...a,
+            submissionCount: aggById.get(a.id)?.total ?? 0,
+            gradedCount: aggById.get(a.id)?.graded ?? 0,
+            mySubmission: mineById.get(a.id)
+                ? { status: mineById.get(a.id)!.status, score: mineById.get(a.id)!.score }
+                : null,
+        }));
+
+        res.status(200).json({ data });
     } catch (e) {
         console.error("GET /assignments error:", e);
         res.status(500).json({ error: "Failed to load assignments" });

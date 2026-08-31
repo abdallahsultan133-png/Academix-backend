@@ -310,15 +310,31 @@ router.post('/:id/enroll', requireAuth, requireRole(...STAFF_ROLES), validateBod
         const { studentId, email } = req.body as { studentId?: string; email?: string };
 
         let resolvedId = studentId;
+        let studentName: string | undefined;
         if (!resolvedId && email) {
-            const [found] = await db.select({ id: user.id }).from(user).where(eq(user.email, email.trim().toLowerCase()));
+            const [found] = await db.select({ id: user.id, name: user.name }).from(user).where(eq(user.email, email.trim().toLowerCase()));
             if (!found) return res.status(404).json({ error: "No user found with that email." });
             resolvedId = found.id;
+            studentName = found.name;
         }
         if (!resolvedId) return res.status(400).json({ error: "Provide studentId or email." });
 
         await db.insert(enrollments).values({ classId, studentId: resolvedId }).onConflictDoNothing();
-        await logAction({ req, action: "class.enroll", resource: "enrollments", resourceId: classId, details: `Enrolled student ${resolvedId}` });
+
+        // Resolve names so the audit entry reads "Enrolled Jane Doe in Algebra"
+        // rather than logging raw ids (the studentId path carries no name yet).
+        if (!studentName) {
+            const [u] = await db.select({ name: user.name }).from(user).where(eq(user.id, resolvedId));
+            studentName = u?.name;
+        }
+        const [enrollClass] = await db.select({ name: classes.name }).from(classes).where(eq(classes.id, classId));
+        await logAction({
+            req,
+            action: "class.enroll",
+            resource: "enrollments",
+            resourceId: classId,
+            details: `Enrolled ${studentName ?? resolvedId}${enrollClass ? ` in ${enrollClass.name}` : ""}`,
+        });
         res.status(201).json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Failed to enroll student" });
@@ -336,7 +352,18 @@ router.delete('/:id/enroll/:studentId', requireAuth, requireRole(...STAFF_ROLES)
 
         const studentId = String(req.params.studentId ?? "");
         await db.delete(enrollments).where(and(eq(enrollments.classId, classId), eq(enrollments.studentId, studentId)));
-        await logAction({ req, action: "class.unenroll", resource: "enrollments", resourceId: classId, details: `Removed student ${studentId}` });
+
+        const [[removedStudent], [unenrollClass]] = await Promise.all([
+            db.select({ name: user.name }).from(user).where(eq(user.id, studentId)),
+            db.select({ name: classes.name }).from(classes).where(eq(classes.id, classId)),
+        ]);
+        await logAction({
+            req,
+            action: "class.unenroll",
+            resource: "enrollments",
+            resourceId: classId,
+            details: `Removed ${removedStudent?.name ?? studentId}${unenrollClass ? ` from ${unenrollClass.name}` : ""}`,
+        });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: "Failed to remove student" });
