@@ -153,12 +153,19 @@ router.post("/exams/:examId/results", requireAuth, requireRole(...STAFF_ROLES), 
         const examId = Number(req.params.examId);
         const { records } = req.body as { records: Array<{ studentId: string; score: number; remarks?: string | null }> };
 
-        if (policy.isTeacher(req.user!)) {
-            const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
-            if (!exam) return res.status(404).json({ error: "Exam not found" });
-            if (!(await policy.canManageClass(req.user!, exam.classId))) {
-                return policy.forbidden(res, "You can only grade exams for classes you teach.");
-            }
+        const [exam] = await db.select({ classId: exams.classId, maxScore: exams.maxScore }).from(exams).where(eq(exams.id, examId));
+        if (!exam) return res.status(404).json({ error: "Exam not found" });
+
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, exam.classId))) {
+            return policy.forbidden(res, "You can only grade exams for classes you teach.");
+        }
+
+        // No mark may exceed the exam's maximum — 85 on an 80-mark exam is a typo.
+        const over = records.find((r) => Number(r.score) > exam.maxScore);
+        if (over) {
+            return res.status(400).json({
+                error: `A score of ${over.score} is above the exam maximum of ${exam.maxScore}. Enter ${exam.maxScore} or lower.`,
+            });
         }
 
         const gradedBy = req.user!.id!;

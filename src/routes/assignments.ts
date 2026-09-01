@@ -390,6 +390,19 @@ router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (
             .where(eq(submissions.assignmentId, assignmentId))
             .orderBy(desc(submissions.submittedAt));
 
+        // Opportunistic backfill: screen text submissions that were never scored
+        // — submitted before detection existed, or before ANTHROPIC_API_KEY was
+        // configured. Fire-and-forget; results land on the next load. Capped per
+        // request so a large class doesn't fan out into one API call per row.
+        let backfilled = 0;
+        for (const row of rows) {
+            if (backfilled >= 25) break;
+            if (row.aiScore == null && row.content && row.content.trim().length >= 20) {
+                void runAiDetection(row.id, row.content);
+                backfilled++;
+            }
+        }
+
         res.status(200).json({ data: rows });
     } catch (e) {
         console.error("GET /assignments/:id/submissions error:", e);
@@ -403,19 +416,29 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
         const submissionId = Number(req.params.submissionId);
         if (!Number.isFinite(submissionId)) return res.status(400).json({ error: "Invalid submission id" });
 
-        if (policy.isTeacher(req.user!)) {
-            const [existingSubmission] = await db
-                .select({ classId: assignments.classId })
-                .from(submissions)
-                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
-                .where(eq(submissions.id, submissionId));
-            if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
-            if (!(await policy.canManageClass(req.user!, existingSubmission.classId))) {
-                return policy.forbidden(res, "You can only grade submissions for classes you teach.");
-            }
+        // Load the submission's assignment up front — needed for the teacher
+        // class-scope check and for the score ceiling below.
+        const [existingSubmission] = await db
+            .select({ classId: assignments.classId, maxScore: assignments.maxScore })
+            .from(submissions)
+            .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+            .where(eq(submissions.id, submissionId));
+        if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
+
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existingSubmission.classId))) {
+            return policy.forbidden(res, "You can only grade submissions for classes you teach.");
         }
 
         const { score, feedback } = req.body as { score: number; feedback?: string | null };
+
+        // A score can't exceed the assignment's maximum. 85 on an 80-point
+        // assignment is almost always a typo — bounce it back so the teacher
+        // enters 80/80, 79/80, and so on.
+        if (Number(score) > existingSubmission.maxScore) {
+            return res.status(400).json({
+                error: `Score can't be above the maximum of ${existingSubmission.maxScore}. Enter ${existingSubmission.maxScore} or lower.`,
+            });
+        }
 
         const [updated] = await db
             .update(submissions)
